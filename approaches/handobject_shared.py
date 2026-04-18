@@ -621,9 +621,14 @@ def detect_personal_objects(
     frame: np.ndarray,
     yolo_model: YOLO,
     conf_th: float,
+    *,
+    predict_device: int | str | None = None,
 ) -> list[tuple[int, int, int, int, str, float]]:
     out: list[tuple[int, int, int, int, str, float]] = []
-    res = yolo_model(frame, conf=conf_th, verbose=False)
+    infer_kw: dict[str, Any] = {"conf": conf_th, "verbose": False}
+    if predict_device is not None:
+        infer_kw["device"] = predict_device
+    res = yolo_model(frame, **infer_kw)
     r0 = res[0] if res else None
     if r0 is None or r0.boxes is None or len(r0.boxes) == 0:
         return out
@@ -680,9 +685,14 @@ def extract_people_and_hands(
     pose_model: YOLO,
     wrist_conf_th: float,
     elbow_conf_th: float,
+    *,
+    predict_device: int | str | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    res = pose_model(frame, verbose=False)
+    infer_kw: dict[str, Any] = {"verbose": False}
+    if predict_device is not None:
+        infer_kw["device"] = predict_device
+    res = pose_model(frame, **infer_kw)
     r0 = res[0] if res else None
     if r0 is None or r0.boxes is None or len(r0.boxes) == 0 or r0.keypoints is None:
         return out
@@ -846,6 +856,29 @@ def resolve_yolo_weights_for_runtime(weights_arg: str) -> str:
     return str(p.resolve())
 
 
+def _weights_is_tensorrt(path: str) -> bool:
+    return Path(path).suffix.lower() == ".engine"
+
+
+def yolo_predict_device_for_args(args: argparse.Namespace) -> int | str:
+    """
+    Dispositivo para YOLO predict. Los .engine (TensorRT) no admiten model.to();
+    hay que pasar device= en cada predict.
+    """
+    d = str(getattr(args, "device", None) or "cpu").strip()
+    low = d.lower()
+    if low in ("", "cpu"):
+        return "cpu"
+    if low.startswith("cuda:"):
+        try:
+            return int(d.split(":", 1)[1])
+        except ValueError:
+            return 0
+    if low == "cuda":
+        return 0
+    return "cpu"
+
+
 def run_pipeline(
     args: argparse.Namespace,
     classifier: Any,
@@ -858,11 +891,15 @@ def run_pipeline(
         raise RuntimeError("Debes indicar exactamente uno: --video o --videos.")
     args.pose_weights = resolve_yolo_weights_for_runtime(str(args.pose_weights))
     args.personal_weights = resolve_yolo_weights_for_runtime(str(args.personal_weights))
+    pose_trt = _weights_is_tensorrt(str(args.pose_weights))
+    personal_trt = _weights_is_tensorrt(str(args.personal_weights))
+    predict_dev = yolo_predict_device_for_args(args)
+
     pose_model = YOLO(args.pose_weights)
-    if args.device:
+    if args.device and not pose_trt:
         pose_model.to(args.device)
     personal_model = YOLO(args.personal_weights)
-    if args.device:
+    if args.device and not personal_trt:
         personal_model.to(args.device)
 
     if args.display == "1280x720":
@@ -960,6 +997,7 @@ def run_pipeline(
                     pose_model=pose_model,
                     wrist_conf_th=float(args.wrist_conf_th),
                     elbow_conf_th=float(args.elbow_conf_th),
+                    predict_device=predict_dev,
                 )
                 trigger_roi_rearm_now = False
                 hands_visible_now = any(len(det["hands"]) > 0 for det in detections)
@@ -1001,6 +1039,7 @@ def run_pipeline(
                             frame=frame,
                             yolo_model=personal_model,
                             conf_th=float(args.personal_conf),
+                            predict_device=predict_dev,
                         )
                 else:
                     personal_boxes = []
