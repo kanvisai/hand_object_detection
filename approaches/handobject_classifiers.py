@@ -58,6 +58,57 @@ def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> boo
     return False
 
 
+def _hf_repo_id_from_snapshot_cache_path(snapshot_dir: Path) -> str | None:
+    """
+    Desde .../models--Orga--repo/snapshots/<hash> o desde el <hash> interno, obtiene "Orga/repo"
+    (cache estándar de huggingface_hub / HF_HOME).
+    """
+    cur: Path = snapshot_dir.resolve()
+    for _ in range(14):
+        p = cur.parent
+        if cur.name and p.name == "snapshots" and p.parent and p.parent.name.startswith("models--"):
+            mname = p.parent.name[9:]
+            if "--" in mname:
+                org, repo = mname.split("--", 1)
+                return f"{org}/{repo}"
+        if cur == cur.parent:
+            break
+        cur = cur.parent
+    return None
+
+
+def _hf_repo_id_for_open_clip_dir(snapshot_dir: Path, original_model_ref: str) -> str | None:
+    """
+    Id org/repo para open_clip (hf-hub:...), además de la caché estándar models--.
+
+    - Snapshots bajo .../hf_manual/Orga__repo/ (convención check_models / descarga local).
+    - Catálogo o referencia original ya en forma UCSC-VLAA/openvision-... (aunque load_ref sea ruta local).
+    """
+    rid = _hf_repo_id_from_snapshot_cache_path(snapshot_dir)
+    if rid:
+        return rid
+    cur = snapshot_dir.resolve()
+    for _ in range(12):
+        name = cur.name
+        if (
+            "__" in name
+            and not name.startswith("models--")
+            and "/" not in name
+        ):
+            org, rest = name.split("__", 1)
+            if org and rest and "__" not in rest:
+                return f"{org}/{rest}"
+        if cur == cur.parent:
+            break
+        cur = cur.parent
+    s = str(original_model_ref).replace("hf-hub:", "").strip()
+    if s.count("/") == 1 and not s.startswith(("/", ".", "\\")) and "\\" not in s:
+        a, b = s.split("/", 1)
+        if a and b and not Path(s).is_absolute():
+            return s
+    return None
+
+
 def _openclip_arch_for_hf_snapshot(model_ref: str) -> str | None:
     """
     Si model_ref describe un modelo MobileCLIP en Hugging Face, devuelve el nombre de arquitectura
@@ -1332,30 +1383,52 @@ class OpenClipLikeClassifier(YesNoTextMixin):
         )
         load_ref = resolve_hf_model_ref(model_name)
         root = Path(load_ref).expanduser()
-        # Snapshot HF local: open_clip espera nombre de arquitectura + pretrained=ruta (no solo la ruta).
+        # Snapshot HF local: MobileCLIP = nombre de arquitectura + pretrained; OpenVision/otros
+        # soportan hf-hub:org/repo (ver docs OpenVision / open_clip) también con checkpoint local.
         if root.is_dir():
             weights_path = _open_clip_weights_file_from_hub_snapshot(root)
             arch = _openclip_arch_for_hf_snapshot(model_name)
-            if arch is None:
-                raise RuntimeError(
-                    "Snapshot OpenCLIP local sin mapeo de arquitectura conocido; "
-                    f"path={root!s} model_ref={model_name!r}. "
-                    "Para MobileCLIP usa p. ej. hf-hub:apple/MobileCLIP-S1-OpenCLIP."
-                )
-            if weights_path is None:
-                raise RuntimeError(
-                    "En el snapshot HF no hay pesos open_clip "
-                    f"(archivos >= {_MIN_OPENCLIP_WEIGHT_BYTES // 1024} KiB: "
-                    "open_clip_pytorch_model.bin preferido, open_clip_model.safetensors). "
-                    f"Directorio: {root.resolve()!s}"
-                )
-            with _torch_load_open_clip_bin_checkpoints_ok():
-                self.model, self.preprocess = open_clip.create_model_from_pretrained(
-                    arch,
-                    pretrained=str(weights_path.resolve()),
-                    device=self.device,
-                )
-            self.tokenizer = open_clip.get_tokenizer(arch)
+            if arch is not None:
+                if weights_path is None:
+                    raise RuntimeError(
+                        "En el snapshot HF no hay pesos open_clip "
+                        f"(archivos >= {_MIN_OPENCLIP_WEIGHT_BYTES // 1024} KiB: "
+                        "open_clip_pytorch_model.bin preferido, open_clip_model.safetensors). "
+                        f"Directorio: {root.resolve()!s}"
+                    )
+                with _torch_load_open_clip_bin_checkpoints_ok():
+                    self.model, self.preprocess = open_clip.create_model_from_pretrained(
+                        arch,
+                        pretrained=str(weights_path.resolve()),
+                        device=self.device,
+                    )
+                self.tokenizer = open_clip.get_tokenizer(arch)
+            else:
+                hf_id = _hf_repo_id_for_open_clip_dir(root, model_name)
+                if not hf_id:
+                    raise RuntimeError(
+                        "Snapshot OpenCLIP local sin mapeo MobileCLIP y no se pudo deducir org/repo "
+                        f"desde ruta local ni model_ref: path={root!s} model_ref={model_name!r}. "
+                        "P. ej. openvision: id Hub en el catálogo "
+                        "(UCSC-VLAA/openvision-vit-large-patch14-224), carpeta hf_manual/Orga__repo, "
+                        "o caché .../models--Orga--repo/snapshots/<hash>. "
+                        "Actualiza open-clip-torch si hace falta soportar hf-hub."
+                    )
+                hub_tag = f"hf-hub:{hf_id}"
+                if weights_path is not None:
+                    with _torch_load_open_clip_bin_checkpoints_ok():
+                        self.model, self.preprocess = open_clip.create_model_from_pretrained(
+                            hub_tag,
+                            pretrained=str(weights_path.resolve()),
+                            device=self.device,
+                        )
+                else:
+                    with _torch_load_open_clip_bin_checkpoints_ok():
+                        self.model, self.preprocess = open_clip.create_model_from_pretrained(
+                            hub_tag,
+                            device=self.device,
+                        )
+                self.tokenizer = open_clip.get_tokenizer(hub_tag)
         else:
             with _torch_load_open_clip_bin_checkpoints_ok():
                 self.model, self.preprocess = open_clip.create_model_from_pretrained(
