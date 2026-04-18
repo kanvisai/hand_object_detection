@@ -3,13 +3,16 @@
 Pre-vuelo: ejecuta check_models, comprueba librerías, GPU, actualiza device y rutas de modelos en experiments_catalog.json,
 y estima tiempos de campaña (heurísticas documentadas).
 
-Uso: python preflight_check.py [--no-update-catalog] [--no-update-model-paths]
+Uso: python preflight_check.py [--no-update-catalog] [--no-update-model-paths] [--output-root PATH]
+
+Colores: desactiva con variable de entorno NO_COLOR. En salida no TTY se omite el color.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_CATALOG = REPO_ROOT / "approaches" / "experiments_catalog.json"
+# Mismo default que test_experiments_approaches.py --output-root
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output_results"
 
 # Paquete requirements.txt -> modulo import para probar
 PACKAGE_IMPORT_CHECKS: list[tuple[str, str]] = [
@@ -67,6 +72,77 @@ _PROFILE_STRIDE: dict[str, int] = {
     "temporal_relaxed": 2,
 }
 
+_W = 62
+
+
+def _rule(char: str = "─") -> None:
+    print(char * _W)
+
+
+def _title(text: str) -> None:
+    print(f"\n┌{'─' * (_W - 2)}┐")
+    pad = max(0, _W - 4 - len(text))
+    print(f"│ {text}{' ' * pad} │")
+    print(f"└{'─' * (_W - 2)}┘")
+
+
+def _section(n: str, title: str) -> None:
+    print(f"\n  {n}  {title}")
+    _rule("·")
+
+
+def _ok_symbol(ok: bool) -> str:
+    return "✓" if ok else "✗"
+
+
+def _use_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR", "").strip()
+
+
+def _c(code: str, text: str) -> str:
+    if not _use_color():
+        return text
+    return f"{code}{text}\033[0m"
+
+
+def _green(text: str) -> str:
+    return _c("\033[1;32m", text)
+
+
+def _red(text: str) -> str:
+    return _c("\033[1;31m", text)
+
+
+def _yellow(text: str) -> str:
+    return _c("\033[1;33m", text)
+
+
+def _dim(text: str) -> str:
+    return _c("\033[0;2m", text)
+
+
+def format_duration_hms(seconds: float) -> str:
+    """Segundos de pared → cadena tipo 12:34:56 (horas sin límite de dígitos)."""
+    t = max(0, int(round(float(seconds))))
+    h, r = divmod(t, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _fmt_gpu_human(gi: dict[str, Any]) -> None:
+    if gi.get("error"):
+        print(f"    {_ok_symbol(False)}  Error: {gi['error']}")
+        return
+    if not gi.get("available"):
+        print("    CUDA no disponible → se usará CPU en el catálogo.")
+        return
+    prim = gi.get("primary") or {}
+    mem = prim.get("total_memory_gib")
+    mem_s = f"{mem} GiB" if mem is not None else "?"
+    print(f"    {_ok_symbol(True)}  {prim.get('name', '?')}  ·  VRAM ~{mem_s}")
+    if int(gi.get("device_count") or 0) > 1:
+        print(f"       ({gi.get('device_count')} dispositivos)")
+
 
 def check_imports() -> tuple[bool, list[dict[str, str]]]:
     rows: list[dict[str, str]] = []
@@ -110,25 +186,31 @@ def gpu_info() -> dict[str, Any]:
         return {"available": False, "error": str(e), "device_str": "cpu"}
 
 
-def update_catalog_device(catalog_path: Path, device: str, *, dry: bool) -> bool:
+def update_catalog_device(
+    catalog_path: Path, device: str, *, dry: bool, quiet: bool = False
+) -> bool:
     if not catalog_path.is_file():
-        print(f"[catalog] No existe {catalog_path}")
+        if not quiet:
+            print(f"    {_ok_symbol(False)}  No existe el catálogo: {catalog_path}")
         return False
     with open(catalog_path, encoding="utf-8") as f:
         data = json.load(f)
     defaults = data.setdefault("defaults", {})
     old = defaults.get("device")
     if old == device:
-        print(f"[catalog] device ya es {device!r}")
+        if not quiet:
+            print(f"    {_ok_symbol(True)}  device ya era {device!r}")
         return True
     defaults["device"] = device
     if dry:
-        print(f"[catalog] dry-run: device {old!r} -> {device!r}")
+        if not quiet:
+            print(f"    (dry-run) device {old!r} → {device!r}")
         return True
-    with open(catalog_path, "w", encoding="utf-8") as f:
+    with open(catalog_path, encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    print(f"[catalog] device actualizado: {old!r} -> {device!r} en {catalog_path}")
+    if not quiet:
+        print(f"    {_ok_symbol(True)}  device {old!r} → {device!r}")
     return True
 
 
@@ -206,6 +288,31 @@ def estimate_campaign_time(
         "estimated_total_wall_sec_gpu": round(gpu_sec, 1),
         "estimated_total_wall_hours_cpu": round(cpu_sec / 3600.0, 3),
         "estimated_total_wall_hours_gpu": round(gpu_sec / 3600.0, 3),
+        "estimated_duration_hms_cpu": format_duration_hms(cpu_sec),
+        "estimated_duration_hms_gpu": format_duration_hms(gpu_sec),
+    }
+
+
+def campaign_metadata(
+    catalog: dict[str, Any], video_rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Cuenta experimentos = approaches × perfiles × vídeos OK (misma lógica que la estimación)."""
+    approaches = [
+        a["id"] for a in catalog.get("approaches", []) if not str(a.get("id", "")).startswith("_")
+    ]
+    profiles = [k for k in (catalog.get("profiles") or {}) if not k.startswith("_")]
+    valid_videos = [v for v in video_rows if v.get("ok")]
+    n_exp = len(approaches) * len(profiles) * len(valid_videos) if valid_videos else 0
+    return {
+        "approach_ids": approaches,
+        "approach_count": len(approaches),
+        "profile_ids": profiles,
+        "profile_count": len(profiles),
+        "videos_listed": len(video_rows),
+        "videos_ok": len(valid_videos),
+        "experiment_count": n_exp,
+        "experiment_strategy": str(catalog.get("experiment_strategy") or "").strip() or "(no definido)",
+        "screening_video_index": catalog.get("screening_video_index"),
     }
 
 
@@ -220,9 +327,18 @@ def main() -> None:
     )
     ap.add_argument("--skip-yolo-engine", action="store_true", help="Reenviado a check_models.")
     ap.add_argument("--download-only-check", action="store_true", help="Solo descarga HF en check_models.")
+    ap.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Raíz de salida (igual que test_experiments_approaches --output-root); solo informativo.",
+    )
     args = ap.parse_args()
 
-    print("=== 1. check_models ===")
+    _title("Preflight · modelos, entorno y campaña estimada")
+    print(f"  Catálogo: {args.catalog}")
+
+    _section("1", "Modelos (check_models)")
     import check_models as cm
 
     catalog_path = args.catalog.expanduser().resolve()
@@ -233,61 +349,174 @@ def main() -> None:
         if args.no_update_model_paths
         else catalog_path,
     )
-    print(
-        json.dumps(
-            {
-                "summary_ok": rep.get("summary_ok"),
-                "yolo_count": len(rep.get("yolo", [])),
-                "hub_count": len(rep.get("hub_models", [])),
-                "experiments_catalog_update": rep.get("experiments_catalog_update"),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+
+    y_ok = sum(1 for y in rep.get("yolo", []) if y.get("ok"))
+    y_n = len(rep.get("yolo") or [])
+    hub_ok = sum(
+        1
+        for h in rep.get("hub_models", [])
+        if h.get("ok") or h.get("optional_gated_skip")
     )
-    if not rep.get("summary_ok"):
-        print("[preflight] check_models fallo. Detalle:")
+    hub_n = len(rep.get("hub_models") or [])
+    summ_ok = bool(rep.get("summary_ok"))
+
+    print(f"    {_ok_symbol(summ_ok)}  Resumen global: {'OK' if summ_ok else 'FALLO'}")
+    print(f"       YOLO ····· {y_ok}/{y_n}  ·  Hugging Face ····· {hub_ok}/{hub_n} modelos")
+
+    ecu = rep.get("experiments_catalog_update") or {}
+    if args.no_update_model_paths:
+        print("       Rutas en experiments_catalog ····· omitidas (--no-update-model-paths)")
+    elif ecu.get("ok"):
+        print(f"       Rutas en experiments_catalog ····· {_ok_symbol(True)}  {ecu.get('path', '')}")
+    elif ecu.get("skipped"):
+        print(f"       Rutas en experiments_catalog ····· (sin escribir: {ecu.get('reason', '')})")
+    elif ecu.get("error"):
+        print(f"       Rutas en experiments_catalog ····· {_ok_symbol(False)}  {ecu.get('error')}")
+
+    if not summ_ok:
+        print()
+        print(_red("    ✗  Modelos / Hub: corrige errores antes de lanzar la campaña."))
+        print("\n    Detalle de fallos:")
         for y in rep.get("yolo", []):
             if not y.get("ok"):
-                print("  YOLO:", json.dumps(y, ensure_ascii=False))
+                print("      YOLO:", json.dumps(y, ensure_ascii=False))
         for h in rep.get("hub_models", []):
-            if not h.get("ok"):
-                print("  HF:", json.dumps({k: h[k] for k in h if k != "cache_path"}, ensure_ascii=False))
+            if not h.get("ok") and not h.get("optional_gated_skip"):
+                print(
+                    "      HF:",
+                    json.dumps({k: h[k] for k in h if k != "cache_path"}, ensure_ascii=False),
+                )
         sys.exit(1)
 
-    print("\n=== 2. Librerías (requirements) ===")
+    _section("2", "Librerías (requirements)")
     ok_lib, rows = check_imports()
-    for r in rows:
-        print(f"  {r['package']}: {r['ok']}")
+    ok_ct = sum(1 for r in rows if r["ok"] == "yes")
+    print(f"    {_ok_symbol(ok_lib)}  {ok_ct}/{len(rows)} paquetes importables")
     if not ok_lib:
-        print("[preflight] Faltan librerías; pip install -r requirements.txt")
+        for r in rows:
+            if r["ok"] != "yes":
+                print(f"       ✗  {r['package']}: {r.get('error', '')[:72]}")
+        print("    → pip install -r requirements.txt")
 
-    print("\n=== 3. GPU ===")
+    _section("3", "GPU y catálogo (device)")
     gi = gpu_info()
-    print(json.dumps(gi, indent=2, ensure_ascii=False))
+    _fmt_gpu_human(gi)
     device_str = "cpu"
     if gi.get("available") and gi.get("details"):
         device_str = f"cuda:{gi['details'][0]['index']}"
 
+    print("    Catálogo experiments_catalog.json")
     if not args.no_update_catalog:
         update_catalog_device(catalog_path, device_str, dry=False)
     else:
-        print(f"[catalog] sin cambios (--no-update-catalog); sugerido device={device_str!r}")
+        print(f"    …  sin escribir device (--no-update-catalog); sugerido: {device_str!r}")
 
-    print("\n=== 4. Vídeos del catálogo + estimación campaña ===")
+    est: dict[str, Any] | None = None
+    vrows: list[dict[str, Any]] = []
+    cat_data: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None
+
+    _section("4", "Vídeos del catálogo")
     if catalog_path.is_file():
         with open(catalog_path, encoding="utf-8") as f:
-            cat = json.load(f)
-        vpaths = cat.get("videos") or []
+            cat_data = json.load(f)
+        vpaths = cat_data.get("videos") or []
         vrows = scan_videos([str(x) for x in vpaths])
-        est = estimate_campaign_time(cat, vrows)
-        print(json.dumps({"videos": vrows, "estimate": est}, indent=2, ensure_ascii=False))
+        v_ok = sum(1 for v in vrows if v.get("ok"))
+        v_all = len(vrows) > 0 and v_ok == len(vrows)
+        print(f"    {_ok_symbol(v_all)}  {v_ok}/{len(vrows)} vídeos accesibles")
+        for v in vrows:
+            if not v.get("ok"):
+                short = str(v.get("path", ""))[-52:]
+                print(f"       ✗  …{short}  ({v.get('error', '')})")
+        est = estimate_campaign_time(cat_data, vrows)
+        meta = campaign_metadata(cat_data, vrows)
     else:
-        print(f"No hay catalogo en {catalog_path}")
+        print(f"    {_ok_symbol(False)}  No se encontró {catalog_path}")
 
-    print("\n=== Resultado ===")
-    if ok_lib:
-        print("Librerías OK.")
+    out_root = args.output_root.expanduser().resolve()
+
+    _title("Campaña · números y salida")
+    issues: list[str] = []
+    if not ok_lib:
+        issues.append("Faltan paquetes Python (requirements).")
+    if not catalog_path.is_file():
+        issues.append("No existe el fichero de catálogo.")
+    elif len(vrows) == 0:
+        issues.append("El catálogo no define vídeos (lista vacía).")
+    elif not all(v.get("ok") for v in vrows):
+        issues.append("Hay rutas de vídeo inválidas o archivos inaccesibles.")
+    elif meta and meta.get("experiment_count", 0) == 0:
+        issues.append("Con los vídeos OK actuales el número de experimentos sería 0.")
+
+    if meta:
+        print(f"    Estrategia de experimentos · {meta['experiment_strategy']}")
+        si = meta.get("screening_video_index")
+        if si is not None and str(meta["experiment_strategy"]).startswith("single"):
+            print(f"    Índice vídeo screening (fase 1) · {si}")
+        print()
+        print(f"    {_dim('Approaches (modelos)')}     {meta['approach_count']}")
+        print(f"    {_dim('Perfiles')}               {meta['profile_count']}")
+        print(f"    {_dim('Vídeos en catálogo')}      {meta['videos_listed']}")
+        print(f"    {_dim('Vídeos OK (existen)')}    {meta['videos_ok']}")
+        print()
+        print(_green(f"    Experimentos previstos · {meta['experiment_count']}") if not issues else _red(f"    Experimentos previstos · {meta['experiment_count']}"))
+        print()
+        print(f"    {_dim('Salida por defecto')}")
+        print(f"       {out_root}/")
+        print(f"       └── <nombre_campaña>/   ← usa --campaign en test_experiments_approaches.py")
+        print(f"             ├── métricas JSON / vídeo procesado / resúmenes")
+        print()
+        print(f"    {_dim('Orquestador')}")
+        print("       python approaches/test_experiments_approaches.py \\")
+        print(f"         --catalog {catalog_path}")
+        print(f"         --output-root {out_root} \\")
+        print('         --campaign "mi_campaña"')
+    else:
+        print(_red("    No hay datos de campaña (catálogo ausente o ilegible)."))
+        if catalog_path.is_file():
+            issues.append("No se pudieron leer metadatos del catálogo.")
+
+    _title("Tiempo estimado (heurística · pared)")
+    if est:
+        cpu_h = format_duration_hms(float(est["estimated_total_wall_sec_cpu"]))
+        gpu_h = format_duration_hms(float(est["estimated_total_wall_sec_gpu"]))
+        tw = max(len(cpu_h), len(gpu_h), 12)
+        h_cpu = float(est["estimated_total_wall_hours_cpu"])
+        h_gpu = float(est["estimated_total_wall_hours_gpu"])
+        print(f"    {'CPU (aprox.)':<16} {cpu_h:>{tw}}    {_dim(f'(~{h_cpu:.2f} h)')}")
+        print(f"    {'GPU (aprox.)':<16} {gpu_h:>{tw}}    {_dim(f'(~{h_gpu:.2f} h)')}")
+        print()
+        print(f"    {_dim('Suma duración vídeos OK ·')} {est['total_video_duration_sec']:.1f} s")
+        wrap = est.get("heuristic_note", "")
+        if wrap:
+            chunk = 54
+            print(f"    {_dim('Nota ·')} ", end="")
+            print(_dim(wrap[:chunk]))
+            for i in range(chunk, len(wrap), chunk):
+                print(f"           {_dim(wrap[i : i + chunk])}")
+    else:
+        print(_yellow("    Sin estimación: falta catálogo o vídeos válidos."))
+
+    print()
+    _rule("═")
+    launch_ready = (
+        summ_ok
+        and ok_lib
+        and catalog_path.is_file()
+        and len(issues) == 0
+        and bool(meta)
+        and int(meta.get("experiment_count") or 0) > 0
+    )
+    if launch_ready:
+        print(_green(f"  {'✓ TODO OK · LISTO PARA LANZAR EXPERIMENTOS':^{_W}}"))
+    else:
+        print(_red(f"  {'✗ PREFLIGHT INCOMPLETO · REVISA ANTES DE LANZAR':^{_W}}"))
+        for it in issues:
+            print(_red(f"    • {it}"))
+    _rule("═")
+    print()
+
     sys.exit(0 if ok_lib else 2)
 
 
