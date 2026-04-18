@@ -63,20 +63,19 @@ _MIN_OPENCLIP_WEIGHT_BYTES = 512 * 1024
 def _open_clip_weights_file_from_hub_snapshot(snapshot_dir: Path) -> Path | None:
     """
     Snapshots HF (apple/MobileCLIP-*-OpenCLIP): pesos en archivos sueltos.
-    Preferir .safetensors (sin pickle); .bin requiere torch.load(weights_only=False) en PyTorch 2.6+.
+
+    Preferir **open_clip_pytorch_model.bin** antes que `.safetensors`:
+    versiones antiguas de open_clip cargan cualquier ruta con `torch.load`; los safetensors
+    no son pickle y provocan `invalid load key`. El .bin va con `_torch_load_open_clip_bin_checkpoints_ok`
+    (weights_only=False, PyTorch 2.6+).
+
+    Si solo existe .safetensors, hace falta open_clip reciente (rama safetensors en load_state_dict)
+    o actualizar open-clip-torch.
     """
     snap = snapshot_dir.expanduser().resolve()
     if not snap.is_dir():
         return None
     m = _MIN_OPENCLIP_WEIGHT_BYTES
-
-    named_st = snap / "open_clip_model.safetensors"
-    if named_st.is_file() and named_st.stat().st_size >= m:
-        return named_st
-
-    st_ok = [p for p in snap.glob("*.safetensors") if p.is_file() and p.stat().st_size >= m]
-    if st_ok:
-        return max(st_ok, key=lambda p: p.stat().st_size)
 
     named_bin = snap / "open_clip_pytorch_model.bin"
     if named_bin.is_file() and named_bin.stat().st_size >= m:
@@ -85,6 +84,14 @@ def _open_clip_weights_file_from_hub_snapshot(snapshot_dir: Path) -> Path | None
     bin_ok = [p for p in snap.glob("*.bin") if p.is_file() and p.stat().st_size >= m]
     if bin_ok:
         return max(bin_ok, key=lambda p: p.stat().st_size)
+
+    named_st = snap / "open_clip_model.safetensors"
+    if named_st.is_file() and named_st.stat().st_size >= m:
+        return named_st
+
+    st_ok = [p for p in snap.glob("*.safetensors") if p.is_file() and p.stat().st_size >= m]
+    if st_ok:
+        return max(st_ok, key=lambda p: p.stat().st_size)
 
     return None
 
@@ -1301,7 +1308,7 @@ class OpenClipLikeClassifier(YesNoTextMixin):
                 raise RuntimeError(
                     "En el snapshot HF no hay pesos open_clip "
                     f"(archivos >= {_MIN_OPENCLIP_WEIGHT_BYTES // 1024} KiB: "
-                    "open_clip_model.safetensors / open_clip_pytorch_model.bin). "
+                    "open_clip_pytorch_model.bin preferido, open_clip_model.safetensors). "
                     f"Directorio: {root.resolve()!s}"
                 )
             with _torch_load_open_clip_bin_checkpoints_ok():
