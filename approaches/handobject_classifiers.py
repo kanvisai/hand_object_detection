@@ -39,22 +39,45 @@ from hf_model_paths import resolve_hf_model_ref
 def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> bool:
     """
     trust_remote_code descarga modulos Python bajo ~/.cache/huggingface/modules/transformers_modules/<hash>/.
-    Si la descarga queda a medias, falta p.ej. rope.py y from_pretrained falla con FileNotFoundError.
+    Si la descarga queda a medias, falta p.ej. lora.py y from_pretrained falla con FileNotFoundError.
     Borramos solo ese hash y el siguiente intento vuelve a bajar el codigo desde el Hub.
     """
-    if not isinstance(exc, FileNotFoundError):
+    chain: list[BaseException] = []
+    cur: BaseException | None = exc
+    while cur is not None and len(chain) < 8:
+        chain.append(cur)
+        cur = getattr(cur, "__cause__", None)
+
+    def _remove_for_filenotfound(fne: FileNotFoundError) -> bool:
+        fn = getattr(fne, "filename", None)
+        if fn and isinstance(fn, (str, bytes)):
+            try:
+                missing = Path(fn.decode() if isinstance(fn, bytes) else str(fn))
+                if "transformers_modules" not in missing.parts:
+                    raise ValueError("not under transformers_modules")
+                # Falta p.ej. lora.py: el padre es la carpeta <hash> a borrar entera.
+                bad = missing.parent
+                if bad.is_dir():
+                    shutil.rmtree(bad)
+                    return True
+            except (OSError, ValueError):
+                pass
+        msg = str(fne)
+        if "transformers_modules" not in msg:
+            return False
+        m = re.search(r"transformers_modules[/\\]([^/\\]+)(?:[/\\]|$)", msg)
+        if not m:
+            return False
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        bad_dir = hf_home / "modules" / "transformers_modules" / m.group(1)
+        if bad_dir.is_dir():
+            shutil.rmtree(bad_dir)
+            return True
         return False
-    msg = str(exc)
-    if "transformers_modules" not in msg:
-        return False
-    m = re.search(r"transformers_modules[/\\]([^/\\]+)[/\\]", msg)
-    if not m:
-        return False
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    bad_dir = hf_home / "modules" / "transformers_modules" / m.group(1)
-    if bad_dir.is_dir():
-        shutil.rmtree(bad_dir)
-        return True
+
+    for e in chain:
+        if isinstance(e, FileNotFoundError) and _remove_for_filenotfound(e):
+            return True
     return False
 
 
@@ -990,12 +1013,18 @@ class MoondreamHandClassifier(YesNoTextMixin):
         dt = torch.float16 if self.device.type == "cuda" else torch.float32
         kw = {"trust_remote_code": True, "torch_dtype": dt}
         self.model = None
-        for attempt in range(2):
+        last_err: BaseException | None = None
+        for attempt in range(5):
             try:
-                self.model = AutoModelForCausalLM.from_pretrained(load_id, **kw).to(self.device)
+                use_kw = dict(kw)
+                if attempt >= 2:
+                    # Tras varios fallos por modulos sueltos, forzar re-descarga del snapshot.
+                    use_kw["force_download"] = True
+                self.model = AutoModelForCausalLM.from_pretrained(load_id, **use_kw).to(self.device)
                 break
             except FileNotFoundError as e:
-                if attempt == 0 and _try_remove_broken_transformers_remote_code_cache(e):
+                last_err = e
+                if _try_remove_broken_transformers_remote_code_cache(e):
                     continue
                 raise RuntimeError(
                     "Moondream: cache de codigo remoto (transformers_modules) incompleto o corrupto. "
@@ -1003,6 +1032,12 @@ class MoondreamHandClassifier(YesNoTextMixin):
                     "Prueba: rm -rf ~/.cache/huggingface/modules/transformers_modules/* "
                     "y vuelve a ejecutar."
                 ) from e
+        if self.model is None and last_err is not None:
+            raise RuntimeError(
+                "Moondream: no se pudo cargar el modelo tras reintentos. "
+                f"Ultimo error: {last_err!s}. Borra ~/.cache/huggingface/modules/transformers_modules/ "
+                "y el snapshot del modelo en hub si hace falta."
+            ) from last_err
         assert self.model is not None
         self.model.eval()
         try:
