@@ -29,6 +29,12 @@ from pathlib import Path
 from typing import Any
 from collections import deque
 
+_APPROACHES_DIR = Path(__file__).resolve().parent
+if str(_APPROACHES_DIR) not in sys.path:
+    sys.path.insert(0, str(_APPROACHES_DIR))
+
+from yolo_weights_download import YOLO_PT_DOWNLOAD_URL, download_yolo_pt_if_missing
+
 import cv2
 import numpy as np
 import torch
@@ -810,6 +816,7 @@ def resolve_yolo_weights_for_runtime(weights_arg: str) -> str:
     """
     Si la ruta apunta a un .pt y existe un .engine en el mismo directorio, usar el .engine (TensorRT).
     Busca el .pt en cwd, junto a handobject_shared.py (approaches/) y ruta absoluta.
+    Para yolo11n*.pt conocidos, si no existen en esas rutas, los descarga en approaches/.
     """
     ws = str(weights_arg).strip()
     if not ws:
@@ -821,6 +828,15 @@ def resolve_yolo_weights_for_runtime(weights_arg: str) -> str:
         Path.cwd() / ws,
     ]
     p = next((c for c in candidates if c.is_file()), None)
+    if p is None:
+        base_name = Path(ws).name
+        if base_name in YOLO_PT_DOWNLOAD_URL:
+            dest = _here / base_name
+            dl_info = download_yolo_pt_if_missing(dest)
+            if dl_info.get("downloaded"):
+                print(f"[yolo] Peso descargado automáticamente: {dest}", flush=True)
+            if dest.is_file():
+                p = dest
     if p is None:
         return ws
     if p.suffix.lower() == ".pt":

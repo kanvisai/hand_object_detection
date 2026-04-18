@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import sys
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -20,15 +19,10 @@ APPROACHES_DIR = REPO_ROOT / "approaches"
 if str(APPROACHES_DIR) not in sys.path:
     sys.path.insert(0, str(APPROACHES_DIR))
 
-YOLO_WEIGHTS_REL = ("approaches/yolo11n-pose.pt", "approaches/yolo11n.pt")
+from yolo_weights_download import YOLO_PT_DOWNLOAD_URL  # noqa: E402
+from yolo_weights_download import download_yolo_pt_if_missing  # noqa: E402
 
-# Pesos oficiales (GitHub Ultralytics assets); mismos que descarga Ultralytics por nombre.
-YOLO_PT_DOWNLOAD_URL: dict[str, str] = {
-    "yolo11n-pose.pt": (
-        "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt"
-    ),
-    "yolo11n.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
-}
+YOLO_WEIGHTS_REL = ("approaches/yolo11n-pose.pt", "approaches/yolo11n.pt")
 
 # Fallos por repo gated / 401 no hacen fallar summary_ok si solo afectan a estos ids.
 HUB_OPTIONAL_REPO_IDS = frozenset({"google/paligemma2-3b-pt-224"})
@@ -91,28 +85,6 @@ def _hub_row_extra(repo_id: str) -> dict[str, str]:
             f"Cache HF nativo (snapshots/<hash>/): {snap_parent}/"
         ),
     }
-
-
-def download_yolo_pt_if_missing(pt: Path) -> dict[str, Any]:
-    """Descarga el .pt desde GitHub assets si falta."""
-    info: dict[str, Any] = {"pt": str(pt), "downloaded": False}
-    if pt.is_file():
-        return info
-    url = YOLO_PT_DOWNLOAD_URL.get(pt.name)
-    if not url:
-        info["error"] = f"No hay URL de descarga para {pt.name}"
-        return info
-    pt.parent.mkdir(parents=True, exist_ok=True)
-    tmp = pt.with_suffix(pt.suffix + ".part")
-    try:
-        urllib.request.urlretrieve(url, tmp)  # noqa: S310 — URL fija autoría Ultralytics
-        tmp.replace(pt)
-        info["downloaded"] = True
-    except OSError as e:
-        info["error"] = str(e)
-        if tmp.is_file():
-            tmp.unlink(missing_ok=True)
-    return info
 
 
 def ensure_yolo_engine(pt: Path, *, skip_engine: bool) -> dict[str, Any]:
