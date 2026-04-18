@@ -5,6 +5,7 @@ Usados por test_new_handobject_*.py junto con handobject_shared.run_pipeline.
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import shutil
@@ -36,10 +37,76 @@ except ImportError:  # pragma: no cover
 from hf_model_paths import resolve_hf_model_ref
 
 
+def _parse_filenotfound_missing_path(fne: FileNotFoundError) -> Path | None:
+    """Obtiene el path que fallo (layers.py, etc.) desde filename o el mensaje."""
+    fn = getattr(fne, "filename", None)
+    if fn and isinstance(fn, (str, bytes)):
+        try:
+            return Path(fn.decode() if isinstance(fn, bytes) else str(fn))
+        except (TypeError, ValueError):
+            pass
+    msg = str(fne)
+    m = re.search(r"No such file or directory:\s*['\"]([^'\"]+)['\"]", msg)
+    if m:
+        try:
+            return Path(m.group(1))
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r"transformers_modules[/\\][^'\"\s]+", msg)
+    if m:
+        try:
+            return Path(m.group(0))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _rmtree_transformers_modules_hash_dir(missing_path: Path) -> bool:
+    """
+    Borra .../transformers_modules/<hash>/ cuando falta un .py dentro (descarga remota a medias).
+    El padre del archivo faltante es <hash>; su padre debe llamarse transformers_modules.
+    """
+    cur = missing_path
+    for _ in range(40):
+        if cur.parent == cur:
+            break
+        parent = cur.parent
+        if parent.parent.name == "transformers_modules":
+            try:
+                shutil.rmtree(parent)
+                importlib.invalidate_caches()
+                return True
+            except OSError:
+                try:
+                    shutil.rmtree(parent, ignore_errors=True)
+                    importlib.invalidate_caches()
+                    return True
+                except OSError:
+                    return False
+        cur = parent
+    return False
+
+
+def _nuke_all_transformers_modules_remote_code_dirs() -> bool:
+    """Borra todo ~/.cache/huggingface/modules/transformers_modules (ultimo recurso)."""
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    root = hf_home / "modules" / "transformers_modules"
+    if not root.is_dir():
+        return False
+    try:
+        shutil.rmtree(root)
+        importlib.invalidate_caches()
+        return True
+    except OSError:
+        shutil.rmtree(root, ignore_errors=True)
+        importlib.invalidate_caches()
+        return True
+
+
 def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> bool:
     """
     trust_remote_code descarga modulos Python bajo ~/.cache/huggingface/modules/transformers_modules/<hash>/.
-    Si la descarga queda a medias, falta p.ej. lora.py y from_pretrained falla con FileNotFoundError.
+    Si la descarga queda a medias, falta p.ej. layers.py y from_pretrained falla con FileNotFoundError.
     Borramos solo ese hash y el siguiente intento vuelve a bajar el codigo desde el Hub.
     """
     chain: list[BaseException] = []
@@ -49,18 +116,21 @@ def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> boo
         cur = getattr(cur, "__cause__", None)
 
     def _remove_for_filenotfound(fne: FileNotFoundError) -> bool:
+        missing = _parse_filenotfound_missing_path(fne)
+        if missing is not None and "transformers_modules" in missing.parts:
+            if _rmtree_transformers_modules_hash_dir(missing):
+                return True
         fn = getattr(fne, "filename", None)
         if fn and isinstance(fn, (str, bytes)):
             try:
-                missing = Path(fn.decode() if isinstance(fn, bytes) else str(fn))
-                if "transformers_modules" not in missing.parts:
-                    raise ValueError("not under transformers_modules")
-                # Falta p.ej. lora.py: el padre es la carpeta <hash> a borrar entera.
-                bad = missing.parent
-                if bad.is_dir():
-                    shutil.rmtree(bad)
-                    return True
-            except (OSError, ValueError):
+                mp = Path(fn.decode() if isinstance(fn, bytes) else str(fn))
+                if "transformers_modules" in mp.parts:
+                    bad = mp.parent
+                    if bad.parent.name == "transformers_modules" and bad.exists():
+                        shutil.rmtree(bad)
+                        importlib.invalidate_caches()
+                        return True
+            except OSError:
                 pass
         msg = str(fne)
         if "transformers_modules" not in msg:
@@ -72,6 +142,7 @@ def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> boo
         bad_dir = hf_home / "modules" / "transformers_modules" / m.group(1)
         if bad_dir.is_dir():
             shutil.rmtree(bad_dir)
+            importlib.invalidate_caches()
             return True
         return False
 
@@ -1020,6 +1091,9 @@ class MoondreamHandClassifier(YesNoTextMixin):
                 if attempt >= 2:
                     # Tras varios fallos por modulos sueltos, forzar re-descarga del snapshot.
                     use_kw["force_download"] = True
+                if attempt >= 4:
+                    # Ultimo intento: caché de código remoto a menudo queda inconsistente (falta layers.py).
+                    _nuke_all_transformers_modules_remote_code_dirs()
                 self.model = AutoModelForCausalLM.from_pretrained(load_id, **use_kw).to(self.device)
                 break
             except FileNotFoundError as e:

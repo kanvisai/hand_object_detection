@@ -1548,6 +1548,229 @@ def _latency_and_pipeline_from_metrics(metrics_path: Path) -> tuple[dict[str, An
     return latency_block, pipe
 
 
+def _median_optional(xs: list[float | None]) -> float | None:
+    vals = [float(x) for x in xs if x is not None]
+    if not vals:
+        return None
+    return float(statistics.median(vals))
+
+
+def _phase4_capacity_cloud_metrics(p_inner: dict[str, Any]) -> dict[str, Any]:
+    """
+    Métricas extra para dimensionar cloud / coste: VRAM y RSS por proceso, curva N,
+    estabilidad del barrido, proxies de throughput y arranque.
+    """
+    steps_raw = p_inner.get("steps") or []
+    steps = [s for s in steps_raw if not s.get("skipped")]
+    n_last = int(p_inner.get("last_fully_successful_n_parallel") or 0)
+
+    out: dict[str, Any] = {
+        "sweep_stability": {
+            "steps_total": len(steps_raw),
+            "steps_non_skipped": len(steps),
+            "steps_all_success": sum(1 for s in steps if s.get("all_success")),
+            "steps_any_failure": sum(1 for s in steps if not s.get("all_success")),
+            "sweep_ended_because": p_inner.get("sweep_ended_because"),
+        },
+        "parallel_scaling_steps": [],
+        "single_stream_process_resources": None,
+        "at_last_successful_n_parallel": None,
+        "cold_start_proxy_sec": None,
+        "throughput_estimates": None,
+        "video_duration_sec_from_n1_metrics": None,
+    }
+
+    mp_n1 = _metrics_path_n1_first_ok(p_inner)
+    dur_clip: float | None = None
+    est_naive_parallel_mem: int | None = None
+    if mp_n1 and mp_n1.is_file():
+        try:
+            with open(mp_n1, encoding="utf-8") as f:
+                raw_m = json.load(f)
+            em = enrich_pipeline_report(raw_m)
+            d0 = em.get("video_duration_sec") or em.get("video_duration_sec_metadata")
+            if d0 is not None:
+                dur_clip = float(d0)
+                out["video_duration_sec_from_n1_metrics"] = round(dur_clip, 6)
+            if raw_m.get("est_max_parallel_streams_by_memory_naive") is not None:
+                est_naive_parallel_mem = int(raw_m["est_max_parallel_streams_by_memory_naive"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    for s in steps:
+        nn = int(s.get("n_parallel") or 0)
+        bw = s.get("batch_wall_clock_sec")
+        mw = s.get("mean_pipeline_wall_sec")
+        entry_sc: dict[str, Any] = {
+            "n_parallel": nn,
+            "all_success": bool(s.get("all_success")),
+            "any_oom_suspect": bool(s.get("any_oom_suspect")),
+            "batch_wall_clock_sec": bw,
+            "mean_pipeline_wall_sec": mw,
+            "mean_subprocess_wall_sec": s.get("mean_subprocess_wall_sec"),
+            "peak_nvidia_gpu_mem_used_mib_smi": s.get("peak_nvidia_gpu_mem_used_mib_smi"),
+            "sum_host_peak_rss_mib_from_runs": s.get("sum_host_peak_rss_mib_from_runs"),
+        }
+        if (
+            dur_clip is not None
+            and bw is not None
+            and float(bw) > 0
+            and nn > 0
+            and s.get("all_success")
+        ):
+            # Streams completados en paralelo por segundo de reloj del lote (orden de magnitud).
+            entry_sc["estimated_full_clip_streams_per_wall_clock_sec"] = round(
+                float(nn) / float(bw), 6
+            )
+            entry_sc["estimated_video_seconds_processed_per_wall_clock_sec"] = round(
+                float(nn) * float(dur_clip) / float(bw), 6
+            )
+        out["parallel_scaling_steps"].append(entry_sc)
+
+    n1_step = next(
+        (x for x in steps if int(x.get("n_parallel") or 0) == 1 and x.get("all_success")),
+        None,
+    )
+    if n1_step:
+        rows_r: list[dict[str, Any]] = []
+        cold_deltas: list[float] = []
+        naive_par: list[int] = []
+        for r in n1_step.get("runs") or []:
+            rd = r.get("run_dir")
+            wc = r.get("wall_clock_processing_sec")
+            if not rd:
+                continue
+            row = extract_resource_row_from_run_dir(str(rd))
+            rows_r.append(row)
+            try:
+                mp_one = Path(str(rd)) / "metrics.json"
+                if mp_one.is_file():
+                    with open(mp_one, encoding="utf-8") as mf:
+                        mj = json.load(mf)
+                    if mj.get("est_max_parallel_streams_by_memory_naive") is not None:
+                        naive_par.append(int(mj["est_max_parallel_streams_by_memory_naive"]))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+            if wc is not None and row.get("subprocess_wall_sec") is not None:
+                cold_deltas.append(float(row["subprocess_wall_sec"]) - float(wc))
+
+        if rows_r:
+            out["single_stream_process_resources"] = {
+                "median_torch_cuda_peak_allocated_mib": _median_optional(
+                    [x.get("torch_cuda_peak_allocated_mib") for x in rows_r]
+                ),
+                "median_host_peak_rss_mib": _median_optional([x.get("host_peak_rss_mib") for x in rows_r]),
+                "median_nvidia_gpu_utilization_mean_percent": _median_optional(
+                    [x.get("nvidia_gpu_utilization_mean_percent") for x in rows_r]
+                ),
+                "median_nvidia_gpu_memory_used_mean_mib": _median_optional(
+                    [x.get("nvidia_gpu_memory_used_mean_mib") for x in rows_r]
+                ),
+                "median_subprocess_wall_sec": _median_optional([x.get("subprocess_wall_sec") for x in rows_r]),
+                "runs_sampled": len(rows_r),
+                "est_max_parallel_streams_by_memory_naive_from_metrics": (
+                    int(statistics.median(naive_par)) if naive_par else None
+                ),
+            }
+        if cold_deltas:
+            out["cold_start_proxy_sec"] = {
+                "note": "subprocess_wall_sec − wall_clock_processing_sec por run en lote N=1 (carga modelo + overhead).",
+                "median_subprocess_minus_pipeline_sec": round(float(statistics.median(cold_deltas)), 6),
+                "max_subprocess_minus_pipeline_sec": round(max(cold_deltas), 6),
+            }
+
+    max_step = next(
+        (
+            x
+            for x in steps
+            if int(x.get("n_parallel") or 0) == n_last and x.get("all_success") and n_last > 0
+        ),
+        None,
+    )
+    if max_step and n_last > 0:
+        rss_sum = max_step.get("sum_host_peak_rss_mib_from_runs")
+        rss_per = round(float(rss_sum) / float(n_last), 4) if rss_sum is not None else None
+        rows_mx: list[dict[str, Any]] = []
+        for r in max_step.get("runs") or []:
+            rd = r.get("run_dir")
+            if rd and r.get("success"):
+                rows_mx.append(extract_resource_row_from_run_dir(str(rd)))
+        median_torch = _median_optional([x.get("torch_cuda_peak_allocated_mib") for x in rows_mx])
+        median_util = _median_optional([x.get("nvidia_gpu_utilization_mean_percent") for x in rows_mx])
+        median_gpu_mem_used = _median_optional([x.get("nvidia_gpu_memory_used_mean_mib") for x in rows_mx])
+        gpu_tot = None
+        for x in rows_mx:
+            if x.get("nvidia_gpu_memory_total_mib_sample"):
+                gpu_tot = float(x["nvidia_gpu_memory_total_mib_sample"])
+                break
+        headroom = None
+        if gpu_tot and median_gpu_mem_used is not None:
+            headroom = round(max(0.0, (gpu_tot - median_gpu_mem_used) / gpu_tot), 4)
+        out["at_last_successful_n_parallel"] = {
+            "n_parallel": n_last,
+            "est_host_rss_mib_per_stream_sum_over_n": rss_per,
+            "median_torch_cuda_peak_allocated_mib_per_process": median_torch,
+            "median_nvidia_gpu_utilization_mean_percent_while_run": median_util,
+            "median_nvidia_gpu_memory_used_mean_mib_while_run": median_gpu_mem_used,
+            "nvidia_gpu_memory_total_mib_sample_if_present": gpu_tot,
+            "est_gpu_utilization_headroom_vs_device_mean": headroom,
+            "note_torch": (
+                "Pico PyTorch por proceso (~VRAM de ese stream); no suma linealmente al usar varios procesos "
+                "en una sola GPU."
+            ),
+            "runs_sampled": len(rows_mx),
+        }
+
+    n1_sc = next(
+        (
+            x
+            for x in out["parallel_scaling_steps"]
+            if int(x.get("n_parallel") or 0) == 1 and x.get("all_success")
+        ),
+        None,
+    )
+    nmax_sc = next(
+        (
+            x
+            for x in out["parallel_scaling_steps"]
+            if int(x.get("n_parallel") or 0) == n_last and x.get("all_success") and n_last >= 1
+        ),
+        None,
+    )
+    tp: dict[str, Any] = {}
+    if n1_sc and nmax_sc and n_last > 1:
+        bw1 = n1_sc.get("batch_wall_clock_sec")
+        bwm = nmax_sc.get("batch_wall_clock_sec")
+        sp1 = n1_sc.get("estimated_full_clip_streams_per_wall_clock_sec")
+        spm = nmax_sc.get("estimated_full_clip_streams_per_wall_clock_sec")
+        if sp1 and spm and float(sp1) > 0:
+            tp["ratio_streams_per_sec_n_max_vs_n1"] = round(float(spm) / float(sp1), 6)
+        mw1 = n1_sc.get("mean_pipeline_wall_sec")
+        mwm = nmax_sc.get("mean_pipeline_wall_sec")
+        if mw1 and mwm and float(mw1) > 0:
+            tp["ratio_mean_pipeline_wall_n_max_vs_n1"] = round(float(mwm) / float(mw1), 6)
+            tp["note_ratio_pipeline"] = (
+                "Si >>1: mucha contienda al paralelizar (cada stream más lento). Si ~1: escalado eficiente en tiempo por stream."
+            )
+    if dur_clip and nmax_sc:
+        bw = nmax_sc.get("batch_wall_clock_sec")
+        if bw and float(bw) > 0 and n_last > 0:
+            # Igual que segundos de vídeo por segundo de reloj del lote; equivale a horas/h en magnitud.
+            tp["estimated_video_hours_per_gpu_wall_hour_at_n_max"] = round(
+                float(n_last) * float(dur_clip) / float(bw),
+                6,
+            )
+    if est_naive_parallel_mem is not None:
+        tp["est_max_parallel_streams_by_memory_naive_snapshot"] = est_naive_parallel_mem
+        tp["note_naive_parallel_mem"] = (
+            "Heurística VRAM_total/torch_peak un solo proceso; contrastar con last_fully_successful_n_parallel."
+        )
+    if tp:
+        out["throughput_estimates"] = tp
+
+    return out
+
+
 def run_phase4_multi_model_sweep(
     catalog: dict[str, Any],
     campaign_dir: Path,
@@ -1620,6 +1843,8 @@ def run_phase4_multi_model_sweep(
                 }
                 entry["pipeline_single_stream"] = {}
 
+            entry["capacity_cloud_metrics"] = _phase4_capacity_cloud_metrics(p_inner)
+
             entry["last_fully_successful_n_parallel"] = p_inner.get("last_fully_successful_n_parallel")
             entry["sweep_ended_because"] = p_inner.get("sweep_ended_because")
             entry["n_steps_tried"] = p_inner.get("n_steps_tried")
@@ -1648,9 +1873,14 @@ def run_phase4_multi_model_sweep(
     return {
         "generated_utc": _utc_iso(),
         "phase": 4,
+        "phase4_cloud_assumptions_note": (
+            "Ratios €/hora o coste por stream no están en este JSON; combine manualmente con "
+            "capacity_cloud_metrics y precios de instancia GPU."
+        ),
         "file_role": (
             "Resumen fase 4: barrido paralelo N por cada approach (mismo vídeo y perfil). "
-            "Models[] incluye phase3_style_summary y latency_vlm_calls desde run N=1 si existió. "
+            "Models[] incluye latency_vlm_calls, pipeline_single_stream y capacity_cloud_metrics "
+            "(VRAM/RSS/utilización/curva N/throughput proxies). "
             "derived_wall_clock_per_10s_video_sec ≈ tiempo de pipeline para 10 s de vídeo real "
             "(mismo cociente wall/duración × 10)."
         ),
@@ -1671,6 +1901,23 @@ def run_phase4_multi_model_sweep(
                 "wall_clock_processing_sec / video_duration_sec × 10; orden de magnitud para procesar 10 s de clip."
             ),
             "last_fully_successful_n_parallel": "Igual que fase 3: máximo N con todos los subprocesos OK sin OOM.",
+            "capacity_cloud_metrics.parallel_scaling_steps": (
+                "Por cada N probado: tiempos de lote/pipeline, RSS sumada, memoria GPU vía nvidia-smi si hubo; "
+                "estimated_* son proxies con duración del clip tomada del metrics N=1."
+            ),
+            "capacity_cloud_metrics.single_stream_process_resources": (
+                "Medianas sobre runs del lote N=1 OK: pico PyTorch VRAM, RSS host, utilización GPU y memoria nvidia-smi."
+            ),
+            "capacity_cloud_metrics.at_last_successful_n_parallel": (
+                "En el último N con todos OK: RSS/n como proxy por stream, medianas por proceso en ese lote, cabeza GPU."
+            ),
+            "capacity_cloud_metrics.cold_start_proxy_sec": (
+                "Diferencia subprocess_wall − pipeline wall por run N=1 (modelo + arranque vs trabajo útil)."
+            ),
+            "capacity_cloud_metrics.throughput_estimates": (
+                "Ratios N_max vs N=1 en streams/s y tiempo pipeline; horas de vídeo por hora de reloj GPU en N_max; heurística naive VRAM."
+            ),
+            "capacity_cloud_metrics.sweep_stability": "Conteos de pasos OK/fallo del barrido y razón de parada.",
         },
         "models": models,
     }
