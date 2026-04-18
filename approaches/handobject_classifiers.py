@@ -55,6 +55,30 @@ def _openclip_arch_for_hf_snapshot(model_ref: str) -> str | None:
     return "MobileCLIP-S1"
 
 
+def _open_clip_weights_file_from_hub_snapshot(snapshot_dir: Path) -> Path | None:
+    """
+    Snapshots de repos tipo apple/MobileCLIP-*-OpenCLIP guardan pesos como archivo en la raíz,
+    no como carpeta cargable por `pretrained=`. open_clip exige ruta a .safetensors o .bin.
+    """
+    snap = snapshot_dir.expanduser().resolve()
+    if not snap.is_dir():
+        return None
+    for name in ("open_clip_model.safetensors", "open_clip_pytorch_model.bin"):
+        p = snap / name
+        if p.is_file() and p.stat().st_size > 1000:
+            return p
+    best: Path | None = None
+    best_sz = 0
+    for pat in ("*.safetensors", "*.bin"):
+        for p in snap.glob(pat):
+            if not p.is_file():
+                continue
+            sz = p.stat().st_size
+            if sz > best_sz and sz > 1_000_000:
+                best, best_sz = p, sz
+    return best
+
+
 def _internlm_past_seq_length(past_key_values: Any) -> int:
     """Longitud de secuencia en cache; tuple legacy o DynamicCache (K/V por capa pueden ser None al inicio)."""
     if past_key_values is None:
@@ -1236,6 +1260,7 @@ class OpenClipLikeClassifier(YesNoTextMixin):
         root = Path(load_ref).expanduser()
         # Snapshot HF local: open_clip espera nombre de arquitectura + pretrained=ruta (no solo la ruta).
         if root.is_dir():
+            weights_path = _open_clip_weights_file_from_hub_snapshot(root)
             arch = _openclip_arch_for_hf_snapshot(model_name)
             if arch is None:
                 raise RuntimeError(
@@ -1243,9 +1268,15 @@ class OpenClipLikeClassifier(YesNoTextMixin):
                     f"path={root!s} model_ref={model_name!r}. "
                     "Para MobileCLIP usa p. ej. hf-hub:apple/MobileCLIP-S1-OpenCLIP."
                 )
+            if weights_path is None:
+                raise RuntimeError(
+                    "En el snapshot HF no hay pesos open_clip "
+                    "(open_clip_model.safetensors / open_clip_pytorch_model.bin). "
+                    f"Directorio: {root.resolve()!s}"
+                )
             self.model, self.preprocess = open_clip.create_model_from_pretrained(
                 arch,
-                pretrained=str(root.resolve()),
+                pretrained=str(weights_path.resolve()),
                 device=self.device,
             )
             self.tokenizer = open_clip.get_tokenizer(arch)
