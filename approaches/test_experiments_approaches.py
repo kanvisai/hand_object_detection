@@ -5,7 +5,8 @@ volcando JSON enriquecido + video bajo output_results/. phase1_summary.json incl
 (conteos, tasas de éxito por approach, medianas/p90). Cada ejecución escribe también
 output_results/<campaña>/logs/orchestrator_<UTC>.log (salida del orquestador + stdout/stderr de cada hijo).
 
-Tras la fase 1, opcionalmente lanza fase 2: 2 mejores modelos, N videos en paralelo (cada modelo en su tanda).
+Tras la fase 1, opcionalmente lanza fase 2: por defecto los 2 mejores modelos; con --phase2-all-ranked todos los
+del ranking (mejor perfil c/u), N videos en paralelo por modelo (cada modelo en su tanda).
 
 Modo sin ventana: cada run pasa --save (video en disco); no se usa cv2.imshow. Entorno headless
 (QT_QPA_PLATFORM=offscreen, MPLBACKEND=Agg) para evitar GUI accidental en segundo plano.
@@ -714,16 +715,16 @@ def build_merged_for_phase2(
 def phase2_parallel_batch(
     catalog: dict[str, Any],
     campaign_dir: Path,
-    top2: list[dict[str, Any]],
+    ranked_entries: list[dict[str, Any]],
     videos: list[Path],
     workers: int,
     monitor_psutil: bool,
     *,
     stream_log: tuple[TextIO, threading.Lock] | None = None,
 ) -> dict[str, Any]:
-    """Ejecuta cada modelo del top2: todos los videos a la vez (workers = len(videos))."""
+    """Ejecuta cada entrada (approach + mejor perfil): todos los videos a la vez por modelo."""
     results_by_model: list[dict[str, Any]] = []
-    for rank, entry in enumerate(top2, start=1):
+    for rank, entry in enumerate(ranked_entries, start=1):
         aid = entry["approach_id"]
         pid = entry["profile_id"]
         ap_obj = next((x for x in catalog["approaches"] if x["id"] == aid), None)
@@ -784,7 +785,9 @@ def phase2_parallel_batch(
     return {
         "generated_utc": _utc_iso(),
         "phase": 2,
-        "description": "Dos modelos top; cada uno procesa todos los videos en paralelo (secuencialmente entre modelos).",
+        "description": (
+            "Cada approach listado procesa todos los videos en paralelo; los modelos se ejecutan uno tras otro."
+        ),
         "models": results_by_model,
     }
 
@@ -798,7 +801,15 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Solo imprimir numero de runs y ejemplos.")
     ap.add_argument("--limit", type=int, default=0, help="Max runs (0=todos).")
     ap.add_argument("--no-psutil", action="store_true", help="No muestrear RSS/CPU.")
-    ap.add_argument("--no-phase2", action="store_false", dest="phase2", help="No ejecutar fase 2 (paralelo top-2).")
+    ap.add_argument("--no-phase2", action="store_false", dest="phase2", help="No ejecutar fase 2 (paralelo sobre catalogo).")
+    ap.add_argument(
+        "--phase2-all-ranked",
+        action="store_true",
+        help=(
+            "Fase 2: ejecutar todos los approaches con ranking tras fase 1 (mejor perfil cada uno × todos los videos), "
+            "no solo el top-2."
+        ),
+    )
     ap.add_argument("--phase2-workers", type=int, default=4, help="Max hilos paralelos por modelo en fase 2.")
     ap.add_argument(
         "--skip-missing-videos",
@@ -858,7 +869,7 @@ def main() -> None:
         if strat == "single_video_screening":
             print(
                 f"  (fase 1 solo video índice {catalog.get('screening_video_index', 0)}; "
-                "fase 2 = top modelos × todos los videos del catalogo)"
+                "fase 2 = top-2 o --phase2-all-ranked × todos los videos del catalogo)"
             )
         print(f"Runs totales fase 1: {len(runs)}")
         if runs:
@@ -1018,23 +1029,31 @@ def main() -> None:
         print(f"[ok] Resumen fase 1: {summary_path}")
 
         do_phase2 = bool(args.phase2)
-        if do_phase2 and len(top2) >= 1:
+        phase2_entries = list(ranked) if args.phase2_all_ranked else top2
+        sel_note = "todos los rankeados" if args.phase2_all_ranked else "top-2"
+        if do_phase2 and len(phase2_entries) >= 1:
             videos = [Path(v).expanduser() for v in catalog.get("videos") or []]
             videos = [v for v in videos if v.exists()]
             if not videos:
                 print("[phase2] Omitido: no hay videos existentes en el catalogo.")
             else:
+                print(
+                    f"[phase2] Modo: {sel_note} ({len(phase2_entries)} modelo(s)); "
+                    f"{len(videos)} video(s) en paralelo por modelo."
+                )
                 t_p2_0 = time.perf_counter()
                 p2 = phase2_parallel_batch(
                     catalog,
                     campaign_dir,
-                    top2,
+                    phase2_entries,
                     videos,
                     workers=min(args.phase2_workers, len(videos)),
                     monitor_psutil=monitor,
                     stream_log=session_log_tuple,
                 )
                 p2["phase2_orchestrator_wall_sec"] = round(time.perf_counter() - t_p2_0, 3)
+                p2["phase2_selection"] = "all_ranked" if args.phase2_all_ranked else "top2"
+                p2["phase2_models_count"] = len(phase2_entries)
                 if session_log_path:
                     p2["orchestrator_session_log"] = str(session_log_path.resolve())
                 p2_path = campaign_dir / "phase2_parallel_summary.json"

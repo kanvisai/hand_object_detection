@@ -249,13 +249,57 @@ def scan_videos(paths: list[str]) -> list[dict[str, Any]]:
     return out
 
 
+def _effective_approach_profile_ids(catalog: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Igual que matrix en expand_run_specs (test_experiments_approaches)."""
+    approaches = [a for a in catalog.get("approaches", []) if not str(a.get("id", "")).startswith("_")]
+    profiles_raw = catalog.get("profiles") or {}
+    profiles_map = {k: v for k, v in profiles_raw.items() if not k.startswith("_")}
+    matrix = catalog.get("matrix") or {}
+    mat_app = matrix.get("approaches", "all")
+    mat_prof = matrix.get("profiles", "all")
+    if mat_app != "all" and isinstance(mat_app, list):
+        approaches = [a for a in approaches if a.get("id") in mat_app]
+    if mat_prof != "all" and isinstance(mat_prof, list):
+        profiles_map = {k: v for k, v in profiles_map.items() if k in mat_prof}
+    aid_list = [str(a["id"]) for a in approaches]
+    pid_list = list(profiles_map.keys())
+    return aid_list, pid_list
+
+
+def _effective_video_rows_for_estimate(
+    catalog: dict[str, Any], video_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """
+    Videos que cuenta la fase 1 del orquestador (misma idea que expand_run_specs).
+    - single_video_screening: solo el indice screening_video_index (una fila).
+    - full_matrix + matrix.videos: filtra rutas resueltas.
+    """
+    strategy = str(catalog.get("experiment_strategy") or "").strip() or "full_matrix"
+    if strategy == "single_video_screening":
+        idx = int(catalog.get("screening_video_index", 0))
+        if idx < 0 or idx >= len(video_rows):
+            return []
+        row = video_rows[idx]
+        return [row] if row.get("ok") else []
+
+    ok_rows = [v for v in video_rows if v.get("ok")]
+    matrix = catalog.get("matrix") or {}
+    mat_vid = matrix.get("videos", "all")
+    if mat_vid != "all" and isinstance(mat_vid, list):
+        sel = {Path(str(v)).expanduser().resolve() for v in mat_vid}
+        ok_rows = [
+            v for v in ok_rows if Path(str(v.get("path", ""))).expanduser().resolve() in sel
+        ]
+    return ok_rows
+
+
 def estimate_campaign_time(
     catalog: dict[str, Any],
     video_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    approaches = [a["id"] for a in catalog.get("approaches", []) if not str(a.get("id", "")).startswith("_")]
-    profiles = [k for k in (catalog.get("profiles") or {}) if not k.startswith("_")]
-    valid_videos = [v for v in video_rows if v.get("ok")]
+    approaches, profiles = _effective_approach_profile_ids(catalog)
+    valid_videos = _effective_video_rows_for_estimate(catalog, video_rows)
+    videos_ok_all = [v for v in video_rows if v.get("ok")]
 
     total_exp = len(approaches) * len(profiles) * len(valid_videos)
     sum_dur = sum(float(v["duration_sec"] or 0) for v in valid_videos)
@@ -275,14 +319,24 @@ def estimate_campaign_time(
                 cpu_sec += d * cpu_r * adj
                 gpu_sec += d * gpu_r * adj
 
+    strat = str(catalog.get("experiment_strategy") or "").strip() or "full_matrix"
+    note_extra = ""
+    if strat == "single_video_screening":
+        note_extra = (
+            " Fase 1 screening: solo UN video del catalogo (screening_video_index); "
+            "la suma de duraciones ya no incluye el resto de clips."
+        )
     return {
         "experiment_count": total_exp,
-        "videos_ok_count": len(valid_videos),
+        "videos_ok_count": len(videos_ok_all),
+        "videos_used_in_estimate_count": len(valid_videos),
         "total_video_duration_sec": round(sum_dur, 2),
         "heuristic_note": (
             "Estimacion por tablas _REL_CPU_PER_VIDEO_SEC y stride por perfil; "
             "la escena real (ROI, manos, per_hand_fast) cambia llamadas VLM. "
             "Calibra con tus phase1_summary.json cuando tengas datos."
+            " CPU vs GPU: si ejecutas en cuda, la fila GPU es la relevante (CPU suele ser ordenes de magnitud pesimista)."
+            + note_extra
         ),
         "estimated_total_wall_sec_cpu": round(cpu_sec, 1),
         "estimated_total_wall_sec_gpu": round(gpu_sec, 1),
@@ -296,20 +350,19 @@ def estimate_campaign_time(
 def campaign_metadata(
     catalog: dict[str, Any], video_rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Cuenta experimentos = approaches × perfiles × vídeos OK (misma lógica que la estimación)."""
-    approaches = [
-        a["id"] for a in catalog.get("approaches", []) if not str(a.get("id", "")).startswith("_")
-    ]
-    profiles = [k for k in (catalog.get("profiles") or {}) if not k.startswith("_")]
-    valid_videos = [v for v in video_rows if v.get("ok")]
-    n_exp = len(approaches) * len(profiles) * len(valid_videos) if valid_videos else 0
+    """Cuenta experimentos = approaches × perfiles × vídeos (misma lógica que expand_run_specs / estimación)."""
+    approaches, profiles = _effective_approach_profile_ids(catalog)
+    valid_for_exp = _effective_video_rows_for_estimate(catalog, video_rows)
+    videos_ok_all = [v for v in video_rows if v.get("ok")]
+    n_exp = len(approaches) * len(profiles) * len(valid_for_exp) if valid_for_exp else 0
     return {
         "approach_ids": approaches,
         "approach_count": len(approaches),
         "profile_ids": profiles,
         "profile_count": len(profiles),
         "videos_listed": len(video_rows),
-        "videos_ok": len(valid_videos),
+        "videos_ok": len(videos_ok_all),
+        "videos_used_for_phase1_count": len(valid_for_exp),
         "experiment_count": n_exp,
         "experiment_strategy": str(catalog.get("experiment_strategy") or "").strip() or "(no definido)",
         "screening_video_index": catalog.get("screening_video_index"),
@@ -459,6 +512,12 @@ def main() -> None:
         print(f"    {_dim('Perfiles')}               {meta['profile_count']}")
         print(f"    {_dim('Vídeos en catálogo')}      {meta['videos_listed']}")
         print(f"    {_dim('Vídeos OK (existen)')}    {meta['videos_ok']}")
+        v_p1 = int(meta.get("videos_used_for_phase1_count") or 0)
+        if v_p1 != int(meta.get("videos_ok") or 0):
+            print(
+                f"    {_dim('Vídeos en fase 1 (estim.)')}  {v_p1}  "
+                f"{_dim('(p. ej. screening: un solo clip; el resto no cuenta en fase 1)')}"
+            )
         print()
         print(_green(f"    Experimentos previstos · {meta['experiment_count']}") if not issues else _red(f"    Experimentos previstos · {meta['experiment_count']}"))
         print()
@@ -486,6 +545,11 @@ def main() -> None:
         h_gpu = float(est["estimated_total_wall_hours_gpu"])
         print(f"    {'CPU (aprox.)':<16} {cpu_h:>{tw}}    {_dim(f'(~{h_cpu:.2f} h)')}")
         print(f"    {'GPU (aprox.)':<16} {gpu_h:>{tw}}    {_dim(f'(~{h_gpu:.2f} h)')}")
+        if gi.get("available"):
+            print(
+                f"    {_dim('Nota ·')} "
+                f"{_dim('Si ejecutas en GPU (cuda), guía la fila GPU; CPU no es “peor caso” del mismo run, son heurísticas distintas.')}"
+            )
         print()
         print(f"    {_dim('Suma duración vídeos OK ·')} {est['total_video_duration_sec']:.1f} s")
         wrap = est.get("heuristic_note", "")
