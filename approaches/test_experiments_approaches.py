@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Orquesta experimentos mano-objeto: recorre approaches (test_new_handobject_*.py) x perfiles x videos,
-volcando JSON enriquecido + video bajo output_results/. Cada ejecución escribe también
+volcando JSON enriquecido + video bajo output_results/. phase1_summary.json incluye campaign_summary
+(conteos, tasas de éxito por approach, medianas/p90). Cada ejecución escribe también
 output_results/<campaña>/logs/orchestrator_<UTC>.log (salida del orquestador + stdout/stderr de cada hijo).
 
 Tras la fase 1, opcionalmente lanza fase 2: 2 mejores modelos, N videos en paralelo (cada modelo en su tanda).
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import socket
 import sys
@@ -260,6 +262,21 @@ def enrich_pipeline_report(report: dict[str, Any]) -> dict[str, Any]:
     if wall and dur and float(dur) > 0:
         derived["derived_ranking_score"] = round(float(wall) / float(dur), 6)
 
+    vlm_mean = report.get("vlm_latency_mean_sec")
+    if vlm_mean is not None:
+        vm = float(vlm_mean)
+        derived["derived_vlm_mean_latency_ms"] = round(vm * 1000.0, 3)
+        derived["derived_vlm_mean_latency_ns"] = int(round(vm * 1e9))
+    if wall is not None and dur is not None:
+        derived["derived_seconds_over_realtime"] = round(float(wall) - float(dur), 6)
+
+    # Lectura rapida lado a lado en metrics.json (mismo clip):
+    # video_duration_sec ≈ duracion del archivo; video_duration_vlm_application = tiempo total del pipeline.
+    if dur is not None:
+        derived["video_duration_sec"] = round(float(dur), 6)
+    if wall is not None:
+        derived["video_duration_vlm_application"] = round(float(wall), 6)
+
     out = dict(report)
     out.update(derived)
     return out
@@ -369,7 +386,6 @@ def run_single_experiment(
         host_metrics["host_monitor_note"] = "Instala psutil para RSS/CPU del proceso hijo."
 
     envelope: dict[str, Any] = {
-        "ok": proc.returncode == 0,
         "run_id": run_dir.name,
         "approach_id": spec.approach_id,
         "profile_id": spec.profile_id,
@@ -395,6 +411,14 @@ def run_single_experiment(
     else:
         envelope["metrics_missing"] = True
 
+    success_flag = (
+        proc.returncode == 0
+        and metrics_path.exists()
+        and not envelope.get("metrics_load_error")
+        and pipeline_report_indicates_success(report)
+    )
+    envelope["ok"] = success_flag
+
     full = {"envelope": envelope, "pipeline": report}
     summary_path = run_dir / "experiment_summary.json"
     with open(summary_path, "w", encoding="utf-8") as jf:
@@ -408,10 +432,17 @@ def run_single_experiment(
         "approach_id": spec.approach_id,
         "profile_id": spec.profile_id,
         "video_path": str(spec.video_path.resolve()),
-        "success": bool(proc.returncode == 0 and report),
+        "success": success_flag,
         "derived_ranking_score": report.get("derived_ranking_score"),
         "wall_clock_processing_sec": report.get("wall_clock_processing_sec"),
-        "video_duration_sec": report.get("video_duration_sec_metadata"),
+        "video_duration_sec": report.get("video_duration_sec")
+        if report.get("video_duration_sec") is not None
+        else report.get("video_duration_sec_metadata"),
+        "vlm_inference_count": report.get("vlm_inference_count"),
+        "vlm_latency_mean_sec": report.get("vlm_latency_mean_sec"),
+        "derived_vlm_mean_latency_ms": report.get("derived_vlm_mean_latency_ms"),
+        "derived_seconds_over_realtime": report.get("derived_seconds_over_realtime"),
+        "video_duration_vlm_application": report.get("video_duration_vlm_application"),
     }
 
 
@@ -422,6 +453,218 @@ def median(xs: list[float]) -> float | None:
     n = len(s)
     m = n // 2
     return float(s[m]) if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def percentile(xs: list[float], pct: float) -> float | None:
+    """Percentil lineal (pct en [0,100])."""
+    if not xs or not (0 <= pct <= 100):
+        return None
+    s = sorted(xs)
+    n = len(s)
+    if n == 1:
+        return float(s[0])
+    k = (n - 1) * (pct / 100.0)
+    f = int(math.floor(k))
+    c = int(math.ceil(k))
+    if f == c:
+        return float(s[f])
+    return float(s[f] * (c - k) + s[c] * (k - f))
+
+
+def pipeline_report_indicates_success(report: dict[str, Any]) -> bool:
+    """Hay métricas mínimas del pipeline (evita {} o JSON vacío contando como OK)."""
+    if not report:
+        return False
+    return (
+        report.get("wall_clock_processing_sec") is not None
+        or report.get("derived_ranking_score") is not None
+    )
+
+
+def build_best_profile_comparison(
+    run_results: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Una fila por approach usando el mejor perfil (ranked): tiempos medianos para comparar
+    CLIP vs Qwen vs Florence en el mismo vídeo / misma campaña.
+    """
+    rows_out: list[dict[str, Any]] = []
+    for entry in ranked:
+        aid = str(entry.get("approach_id") or "")
+        pid = str(entry.get("profile_id") or "")
+        sub = [
+            r
+            for r in run_results
+            if r.get("success")
+            and str(r.get("approach_id")) == aid
+            and str(r.get("profile_id")) == pid
+        ]
+        walls = [
+            float(r["wall_clock_processing_sec"])
+            for r in sub
+            if r.get("wall_clock_processing_sec") is not None
+        ]
+        durs = [
+            float(r["video_duration_sec"]) for r in sub if r.get("video_duration_sec") is not None
+        ]
+        vlms = [
+            float(r["vlm_latency_mean_sec"])
+            for r in sub
+            if r.get("vlm_latency_mean_sec") is not None
+        ]
+        counts = [
+            float(r["vlm_inference_count"])
+            for r in sub
+            if r.get("vlm_inference_count") is not None
+        ]
+        mw = median(walls)
+        mdur = median(durs)
+        mvlm = median(vlms)
+        mcnt = median(counts)
+        over = (mw - mdur) if mw is not None and mdur is not None else None
+        rows_out.append(
+            {
+                "approach_id": aid,
+                "profile_id": pid,
+                "runs_used": len(sub),
+                "median_wall_clock_processing_sec": round(mw, 6) if mw is not None else None,
+                "median_video_duration_sec": round(mdur, 6) if mdur is not None else None,
+                "median_seconds_over_realtime": round(over, 6) if over is not None else None,
+                "median_vlm_latency_sec_per_query": round(mvlm, 6) if mvlm is not None else None,
+                "median_vlm_latency_ms_per_query": round(mvlm * 1000.0, 3) if mvlm is not None else None,
+                "median_vlm_inference_count": int(round(mcnt)) if mcnt is not None else None,
+                "median_derived_ranking_score": entry.get("median_ranking_score"),
+            }
+        )
+
+    rows_out.sort(
+        key=lambda x: (
+            x["median_wall_clock_processing_sec"] is None,
+            x["median_wall_clock_processing_sec"] if x["median_wall_clock_processing_sec"] is not None else 1e30,
+        )
+    )
+    return rows_out
+
+
+def summarize_phase1_campaign(
+    run_results: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+    top2: list[dict[str, Any]],
+    *,
+    phase1_wall_sec: float,
+) -> dict[str, Any]:
+    """Métricas agregadas de la fase 1 para lectura rápida sin recorrer todos los runs."""
+    n = len(run_results)
+    succeeded = [r for r in run_results if r.get("success")]
+    failed = [r for r in run_results if not r.get("success")]
+    scores = [float(r["derived_ranking_score"]) for r in run_results if r.get("derived_ranking_score") is not None]
+
+    by_approach: dict[str, dict[str, Any]] = {}
+    for r in run_results:
+        aid = str(r.get("approach_id") or "")
+        if aid not in by_approach:
+            by_approach[aid] = {
+                "runs": 0,
+                "success_count": 0,
+                "scores": [],
+                "walls": [],
+                "durs": [],
+                "vlm_means": [],
+                "vlm_counts": [],
+                "overs": [],
+            }
+        by_approach[aid]["runs"] += 1
+        if r.get("success"):
+            by_approach[aid]["success_count"] += 1
+            if r.get("wall_clock_processing_sec") is not None:
+                by_approach[aid]["walls"].append(float(r["wall_clock_processing_sec"]))
+            if r.get("video_duration_sec") is not None:
+                by_approach[aid]["durs"].append(float(r["video_duration_sec"]))
+            if r.get("vlm_latency_mean_sec") is not None:
+                by_approach[aid]["vlm_means"].append(float(r["vlm_latency_mean_sec"]))
+            if r.get("vlm_inference_count") is not None:
+                by_approach[aid]["vlm_counts"].append(float(r["vlm_inference_count"]))
+            if r.get("derived_seconds_over_realtime") is not None:
+                by_approach[aid]["overs"].append(float(r["derived_seconds_over_realtime"]))
+        sc = r.get("derived_ranking_score")
+        if sc is not None:
+            by_approach[aid]["scores"].append(float(sc))
+
+    per_app: dict[str, Any] = {}
+    for aid, d in by_approach.items():
+        rc = int(d["runs"])
+        scount = int(d["success_count"])
+        sc_list = d["scores"]
+        vm = median(d["vlm_means"])
+        per_app[aid] = {
+            "runs": rc,
+            "success_count": scount,
+            "success_rate": round(scount / rc, 4) if rc else 0.0,
+            "median_derived_ranking_score": median(sc_list),
+            "p90_derived_ranking_score": percentile(sc_list, 90),
+            "median_wall_clock_processing_sec": median(d["walls"]),
+            "median_video_duration_sec": median(d["durs"]),
+            "median_seconds_over_realtime": median(d["overs"]),
+            "median_vlm_latency_sec_per_query": round(vm, 6) if vm is not None else None,
+            "median_vlm_latency_ms_per_query": round(vm * 1000.0, 3) if vm is not None else None,
+            "median_vlm_inference_count": int(round(median(d["vlm_counts"])))
+            if d["vlm_counts"]
+            else None,
+        }
+
+    comparison_best_profile = build_best_profile_comparison(run_results, ranked)
+
+    return {
+        "phase1_orchestrator_wall_sec": round(phase1_wall_sec, 3),
+        "runs_planned": n,
+        "runs_succeeded": len(succeeded),
+        "runs_failed": len(failed),
+        "runs_with_derived_ranking_score": len(scores),
+        "ranked_approaches_count": len(ranked),
+        "phase2_eligible_count": len(top2),
+        "derived_ranking_score_global_median": median(scores),
+        "derived_ranking_score_global_p90": percentile(scores, 90),
+        "by_approach": per_app,
+        "comparison_best_profile": comparison_best_profile,
+        "metrics_glossary": {
+            "video_duration_sec": "Duración del clip en segundos (metadatos del vídeo).",
+            "video_duration_vlm_application": (
+                "Tiempo total en segundos del pipeline para ese clip (detección + consultas VLM + salida); "
+                "equivale a wall_clock_processing_sec. Comparar con video_duration_sec."
+            ),
+            "derived_ranking_score": (
+                "wall_clock_processing_sec / video_duration_sec_metadata; menor indica menos tiempo "
+                "de pipeline respecto a la duración del clip."
+            ),
+            "wall_clock_processing_sec": (
+                "Tiempo total del proceso (detección, consultas VLM cuando aplica, escritura de salida)."
+            ),
+            "median_seconds_over_realtime": (
+                "Mediana de (wall − duración vídeo): cuántos segundos por encima del 'tiempo real' del clip."
+            ),
+            "vlm_latency_mean_sec": (
+                "Media de latencias en vlm_calls: por cada consulta al clasificador/VLM, no por frame de vídeo "
+                "(el stride puede hacer que solo algunos frames disparen inferencia)."
+            ),
+            "comparison_best_profile": (
+                "Una fila por approach con su mejor perfil (misma métrica de ranking que phase1); "
+                "ordenado por menor tiempo total de pipeline (carrera a ojo)."
+            ),
+        },
+        "how_to_read": (
+            "Para el mismo clip: median_wall_clock_processing_sec es el tiempo total del pipeline "
+            "(YOLO + VLM + escritura). Si median_video_duration_sec es 10, un valor 10.05 significa ~5 ms "
+            "por encima del tiempo real del vídeo. "
+            "median_vlm_latency_ms_per_query es la media de latencia por llamada al clasificador (consulta VLM); "
+            "no es por frame de vídeo, sino por cada inferencia registrada en vlm_calls. "
+            "comparison_best_profile ordena approaches por menor wall (mejor perfil por approach según ranking)."
+        ),
+        "note": (
+            "derived_ranking_score menor = mejor (wall_pipeline / duracion_video). "
+            "success exige exit 0, metrics.json presente y métricas de pipeline."
+        ),
+    }
 
 
 def rank_approaches_for_phase2(
@@ -645,13 +888,19 @@ def main() -> None:
     else:
         print(f"[campaña] salida en: {campaign_dir}")
 
+    orchestrator_started_utc: str | None = None
+    t_orchestrator_0: float | None = None
+
     try:
+        orchestrator_started_utc = _utc_iso()
+        t_orchestrator_0 = time.perf_counter()
         phase1_dir = campaign_dir / "phase1_runs"
         phase1_dir.mkdir(parents=True, exist_ok=True)
 
         monitor = not args.no_psutil and psutil is not None
 
         run_results: list[dict[str, Any]] = []
+        t_phase1_0 = time.perf_counter()
         for i, spec in enumerate(runs, start=1):
             run_id = _sanitize_id(f"{spec.approach_id}__{spec.profile_id}__{spec.video_path.stem}")
             run_dir = phase1_dir / run_id
@@ -661,18 +910,43 @@ def main() -> None:
                     with open(summary_file, encoding="utf-8") as jf:
                         cached = json.load(jf)
                     env = cached.get("envelope") or {}
-                    pl = cached.get("pipeline") or {}
+                    metrics_path_resume = run_dir / "metrics.json"
+                    metrics_exists = metrics_path_resume.exists()
+                    pl: dict[str, Any]
+                    if metrics_exists:
+                        try:
+                            with open(metrics_path_resume, encoding="utf-8") as mf:
+                                pl = enrich_pipeline_report(json.load(mf))
+                        except (json.JSONDecodeError, OSError):
+                            pl = enrich_pipeline_report(dict(cached.get("pipeline") or {}))
+                    else:
+                        pl = enrich_pipeline_report(dict(cached.get("pipeline") or {}))
+                    success_resume = (
+                        bool(env.get("ok"))
+                        and metrics_exists
+                        and pipeline_report_indicates_success(pl)
+                    )
+                    vid_out = run_dir / "output_video.mp4"
                     run_results.append(
                         {
                             "run_dir": str(run_dir),
                             "summary_json": str(summary_file),
+                            "metrics_json": str(metrics_path_resume) if metrics_exists else "",
+                            "video_out": str(vid_out) if vid_out.exists() else "",
                             "approach_id": spec.approach_id,
                             "profile_id": spec.profile_id,
                             "video_path": str(spec.video_path.resolve()),
-                            "success": bool(env.get("ok")),
+                            "success": success_resume,
                             "derived_ranking_score": pl.get("derived_ranking_score"),
                             "wall_clock_processing_sec": pl.get("wall_clock_processing_sec"),
-                            "video_duration_sec": pl.get("video_duration_sec_metadata"),
+                            "video_duration_sec": pl.get("video_duration_sec")
+                            if pl.get("video_duration_sec") is not None
+                            else pl.get("video_duration_sec_metadata"),
+                            "vlm_inference_count": pl.get("vlm_inference_count"),
+                            "vlm_latency_mean_sec": pl.get("vlm_latency_mean_sec"),
+                            "derived_vlm_mean_latency_ms": pl.get("derived_vlm_mean_latency_ms"),
+                            "derived_seconds_over_realtime": pl.get("derived_seconds_over_realtime"),
+                            "video_duration_vlm_application": pl.get("video_duration_vlm_application"),
                         }
                     )
                     print(f"[resume] {i}/{len(runs)} {run_id}")
@@ -691,7 +965,14 @@ def main() -> None:
             )
             run_results.append(res)
 
+        t_phase1_1 = time.perf_counter()
         ranked, top2 = rank_approaches_for_phase2(run_results)
+        campaign_summary = summarize_phase1_campaign(
+            run_results,
+            ranked,
+            top2,
+            phase1_wall_sec=t_phase1_1 - t_phase1_0,
+        )
 
         phase1_summary = {
             "generated_utc": _utc_iso(),
@@ -711,10 +992,13 @@ def main() -> None:
                 else ""
             ),
             "total_runs": len(runs),
+            "campaign_summary": campaign_summary,
             "runs": run_results,
             "ranking_median_by_approach_best_profile": ranked,
             "phase2_top2": top2,
             "metrics_glossary": {
+                "video_duration_sec": "Duración del clip (s); mismo valor que video_duration_sec_metadata tras enriquecer.",
+                "video_duration_vlm_application": "Tiempo total del pipeline para ese clip (s); igual que wall_clock_processing_sec; comparar con video_duration_sec.",
                 "derived_ranking_score": "wall_clock_processing_sec / video_duration_sec_metadata (menor = menos tiempo de proceso por segundo de video).",
                 "derived_vlm_compute_sum_sec": "Suma de latency_sec de todas las llamadas al clasificador (tiempo efectivo modelo).",
                 "derived_non_vlm_overhead_sec": "wall_clock - suma VLM (pose, decodificacion, escritura, etc.).",
@@ -725,6 +1009,7 @@ def main() -> None:
                 "torch_cuda_peak_memory_allocated_mib": "Pico VRAM PyTorch si device=cuda.",
                 "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi durante el run (solo CUDA).",
                 "host_peak_rss_bytes": "Pico RSS del proceso hijo (psutil, si disponible).",
+                "campaign_summary": "Bloque resumido: conteos exito/fallo, tiempos orquestador fase 1, medianas/p90 globales y por approach.",
             },
         }
         summary_path = campaign_dir / "phase1_summary.json"
@@ -739,6 +1024,7 @@ def main() -> None:
             if not videos:
                 print("[phase2] Omitido: no hay videos existentes en el catalogo.")
             else:
+                t_p2_0 = time.perf_counter()
                 p2 = phase2_parallel_batch(
                     catalog,
                     campaign_dir,
@@ -748,6 +1034,7 @@ def main() -> None:
                     monitor_psutil=monitor,
                     stream_log=session_log_tuple,
                 )
+                p2["phase2_orchestrator_wall_sec"] = round(time.perf_counter() - t_p2_0, 3)
                 if session_log_path:
                     p2["orchestrator_session_log"] = str(session_log_path.resolve())
                 p2_path = campaign_dir / "phase2_parallel_summary.json"
@@ -755,7 +1042,20 @@ def main() -> None:
                     json.dump(p2, jf, indent=2, ensure_ascii=False)
                 print(f"[ok] Resumen fase 2: {p2_path}")
         elif do_phase2:
-            print("[phase2] No hay al menos 2 modelos rankeables (revisa runs fallidos).")
+            print(
+                "[phase2] No hay modelos en el ranking (ningún run con derived_ranking_score válido). "
+                "Revisa fallos en fase 1 y campaign_summary en phase1_summary.json."
+            )
+
+        # Si hubo excepcion antes, este bloque no corre (no aparece FINALIZADO en el log).
+        orch_end = _utc_iso()
+        orch_wall = time.perf_counter() - t_orchestrator_0 if t_orchestrator_0 is not None else 0.0
+        print("")
+        print("========== FINALIZADO ==========")
+        print(f"  inicio_utc:      {orchestrator_started_utc}")
+        print(f"  fin_utc:         {orch_end}")
+        print(f"  tiempo_total_s:  {orch_wall:.3f}")
+        print("================================")
 
     finally:
         sys.stdout = _orig_stdout
