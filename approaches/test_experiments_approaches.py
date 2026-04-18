@@ -799,7 +799,17 @@ def main() -> None:
     ap.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Raiz output_results.")
     ap.add_argument("--resume", action="store_true", help="Saltar run si experiment_summary.json existe.")
     ap.add_argument("--dry-run", action="store_true", help="Solo imprimir numero de runs y ejemplos.")
-    ap.add_argument("--limit", type=int, default=0, help="Max runs (0=todos).")
+    ap.add_argument("--limit", type=int, default=0, help="Max runs (0=todos). Ignorado si --only-run-index.")
+    ap.add_argument(
+        "--only-run-index",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Ejecutar solo el run N del plan de fase 1 (mismo número que en [run] N/total), p. ej. 63. "
+            "Útil para reprobar un approach/perfil sin esperar los anteriores. Usa --no-phase2 si solo quieres ese run."
+        ),
+    )
     ap.add_argument("--no-psutil", action="store_true", help="No muestrear RSS/CPU.")
     ap.add_argument("--no-phase2", action="store_false", dest="phase2", help="No ejecutar fase 2 (paralelo sobre catalogo).")
     ap.add_argument(
@@ -858,7 +868,16 @@ def main() -> None:
         if not kept:
             raise RuntimeError("Tras --skip-missing-videos no queda ningun video en el catalogo.")
     runs = expand_run_specs(catalog)
-    if args.limit and args.limit > 0:
+    phase1_plan_total = len(runs)
+    if args.only_run_index:
+        if args.only_run_index < 1:
+            raise RuntimeError("--only-run-index debe ser >= 1 (coincide con [run] N/total).")
+        if args.only_run_index > phase1_plan_total:
+            raise RuntimeError(
+                f"--only-run-index={args.only_run_index} fuera de rango: el plan tiene {phase1_plan_total} runs."
+            )
+        runs = [runs[args.only_run_index - 1]]
+    elif args.limit and args.limit > 0:
         runs = runs[: args.limit]
 
     if args.dry_run:
@@ -872,6 +891,11 @@ def main() -> None:
                 "fase 2 = top-2 o --phase2-all-ranked × todos los videos del catalogo)"
             )
         print(f"Runs totales fase 1: {len(runs)}")
+        if args.only_run_index:
+            print(
+                f"  (modo --only-run-index {args.only_run_index} de {phase1_plan_total}; "
+                "fase 1 ejecutará 1 run)"
+            )
         if runs:
             r0 = runs[0]
             print(f"Ejemplo: {r0.approach_id} / {r0.profile_id} / {r0.video_path.name}")
@@ -907,12 +931,19 @@ def main() -> None:
         t_orchestrator_0 = time.perf_counter()
         phase1_dir = campaign_dir / "phase1_runs"
         phase1_dir.mkdir(parents=True, exist_ok=True)
+        if args.only_run_index:
+            print(
+                f"[phase1] ejecutando solo el run de plan {args.only_run_index}/{phase1_plan_total} "
+                "(--only-run-index; mismo run_id que campaña completa)."
+            )
 
         monitor = not args.no_psutil and psutil is not None
 
         run_results: list[dict[str, Any]] = []
         t_phase1_0 = time.perf_counter()
         for i, spec in enumerate(runs, start=1):
+            disp_i = args.only_run_index if args.only_run_index else i
+            disp_tot = phase1_plan_total if args.only_run_index else len(runs)
             run_id = _sanitize_id(f"{spec.approach_id}__{spec.profile_id}__{spec.video_path.stem}")
             run_dir = phase1_dir / run_id
             summary_file = run_dir / "experiment_summary.json"
@@ -960,13 +991,13 @@ def main() -> None:
                             "video_duration_vlm_application": pl.get("video_duration_vlm_application"),
                         }
                     )
-                    print(f"[resume] {i}/{len(runs)} {run_id}")
+                    print(f"[resume] {disp_i}/{disp_tot} {run_id}")
                     continue
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            print(f"[run] {i}/{len(runs)} {run_id}")
-            lbl = f"[fase1 {i}/{len(runs)} {run_id}]"
+            print(f"[run] {disp_i}/{disp_tot} {run_id}")
+            lbl = f"[fase1 {disp_i}/{disp_tot} {run_id}]"
             res = run_single_experiment(
                 spec,
                 run_dir,
@@ -1003,6 +1034,8 @@ def main() -> None:
                 else ""
             ),
             "total_runs": len(runs),
+            "phase1_plan_total_runs": phase1_plan_total,
+            "phase1_only_run_index": int(args.only_run_index) if args.only_run_index else None,
             "campaign_summary": campaign_summary,
             "runs": run_results,
             "ranking_median_by_approach_best_profile": ranked,

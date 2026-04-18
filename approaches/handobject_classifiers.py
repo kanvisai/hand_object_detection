@@ -5,7 +5,9 @@ Usados por test_new_handobject_*.py junto con handobject_shared.run_pipeline.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +34,28 @@ except ImportError:  # pragma: no cover
     Florence2ForConditionalGeneration = None  # type: ignore[misc, assignment]
 
 from hf_model_paths import resolve_hf_model_ref
+
+
+def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> bool:
+    """
+    trust_remote_code descarga modulos Python bajo ~/.cache/huggingface/modules/transformers_modules/<hash>/.
+    Si la descarga queda a medias, falta p.ej. rope.py y from_pretrained falla con FileNotFoundError.
+    Borramos solo ese hash y el siguiente intento vuelve a bajar el codigo desde el Hub.
+    """
+    if not isinstance(exc, FileNotFoundError):
+        return False
+    msg = str(exc)
+    if "transformers_modules" not in msg:
+        return False
+    m = re.search(r"transformers_modules[/\\]([^/\\]+)[/\\]", msg)
+    if not m:
+        return False
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    bad_dir = hf_home / "modules" / "transformers_modules" / m.group(1)
+    if bad_dir.is_dir():
+        shutil.rmtree(bad_dir)
+        return True
+    return False
 
 
 def _openclip_arch_for_hf_snapshot(model_ref: str) -> str | None:
@@ -912,11 +936,22 @@ class MoondreamHandClassifier(YesNoTextMixin):
             device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
         )
         dt = torch.float16 if self.device.type == "cuda" else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
-            load_id,
-            trust_remote_code=True,
-            torch_dtype=dt,
-        ).to(self.device)
+        kw = {"trust_remote_code": True, "torch_dtype": dt}
+        self.model = None
+        for attempt in range(2):
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(load_id, **kw).to(self.device)
+                break
+            except FileNotFoundError as e:
+                if attempt == 0 and _try_remove_broken_transformers_remote_code_cache(e):
+                    continue
+                raise RuntimeError(
+                    "Moondream: cache de codigo remoto (transformers_modules) incompleto o corrupto. "
+                    f"Intento de reparacion automatica fallo. Detalle: {e!s}. "
+                    "Prueba: rm -rf ~/.cache/huggingface/modules/transformers_modules/* "
+                    "y vuelve a ejecutar."
+                ) from e
+        assert self.model is not None
         self.model.eval()
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(load_id, trust_remote_code=True)
