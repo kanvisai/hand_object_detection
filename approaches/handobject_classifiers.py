@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -55,28 +56,56 @@ def _openclip_arch_for_hf_snapshot(model_ref: str) -> str | None:
     return "MobileCLIP-S1"
 
 
+# Punteros Git LFS ~134 B; pesos reales MobileCLIP ~340 MB.
+_MIN_OPENCLIP_WEIGHT_BYTES = 512 * 1024
+
+
 def _open_clip_weights_file_from_hub_snapshot(snapshot_dir: Path) -> Path | None:
     """
-    Snapshots de repos tipo apple/MobileCLIP-*-OpenCLIP guardan pesos como archivo en la raíz,
-    no como carpeta cargable por `pretrained=`. open_clip exige ruta a .safetensors o .bin.
+    Snapshots HF (apple/MobileCLIP-*-OpenCLIP): pesos en archivos sueltos.
+    Preferir .safetensors (sin pickle); .bin requiere torch.load(weights_only=False) en PyTorch 2.6+.
     """
     snap = snapshot_dir.expanduser().resolve()
     if not snap.is_dir():
         return None
-    for name in ("open_clip_model.safetensors", "open_clip_pytorch_model.bin"):
-        p = snap / name
-        if p.is_file() and p.stat().st_size > 1000:
-            return p
-    best: Path | None = None
-    best_sz = 0
-    for pat in ("*.safetensors", "*.bin"):
-        for p in snap.glob(pat):
-            if not p.is_file():
-                continue
-            sz = p.stat().st_size
-            if sz > best_sz and sz > 1_000_000:
-                best, best_sz = p, sz
-    return best
+    m = _MIN_OPENCLIP_WEIGHT_BYTES
+
+    named_st = snap / "open_clip_model.safetensors"
+    if named_st.is_file() and named_st.stat().st_size >= m:
+        return named_st
+
+    st_ok = [p for p in snap.glob("*.safetensors") if p.is_file() and p.stat().st_size >= m]
+    if st_ok:
+        return max(st_ok, key=lambda p: p.stat().st_size)
+
+    named_bin = snap / "open_clip_pytorch_model.bin"
+    if named_bin.is_file() and named_bin.stat().st_size >= m:
+        return named_bin
+
+    bin_ok = [p for p in snap.glob("*.bin") if p.is_file() and p.stat().st_size >= m]
+    if bin_ok:
+        return max(bin_ok, key=lambda p: p.stat().st_size)
+
+    return None
+
+
+@contextmanager
+def _torch_load_open_clip_bin_checkpoints_ok():
+    """
+    PyTorch >= 2.6 usa weights_only=True por defecto en torch.load; los .bin antiguos
+    de open_clip fallan (pickle). Checkpoints del Hub son de fuente fija (HF/Apple).
+    """
+    orig = torch.load
+
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        kwargs["weights_only"] = False
+        return orig(*args, **kwargs)
+
+    torch.load = _wrapped  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        torch.load = orig  # type: ignore[method-assign]
 
 
 def _internlm_past_seq_length(past_key_values: Any) -> int:
@@ -1271,19 +1300,22 @@ class OpenClipLikeClassifier(YesNoTextMixin):
             if weights_path is None:
                 raise RuntimeError(
                     "En el snapshot HF no hay pesos open_clip "
-                    "(open_clip_model.safetensors / open_clip_pytorch_model.bin). "
+                    f"(archivos >= {_MIN_OPENCLIP_WEIGHT_BYTES // 1024} KiB: "
+                    "open_clip_model.safetensors / open_clip_pytorch_model.bin). "
                     f"Directorio: {root.resolve()!s}"
                 )
-            self.model, self.preprocess = open_clip.create_model_from_pretrained(
-                arch,
-                pretrained=str(weights_path.resolve()),
-                device=self.device,
-            )
+            with _torch_load_open_clip_bin_checkpoints_ok():
+                self.model, self.preprocess = open_clip.create_model_from_pretrained(
+                    arch,
+                    pretrained=str(weights_path.resolve()),
+                    device=self.device,
+                )
             self.tokenizer = open_clip.get_tokenizer(arch)
         else:
-            self.model, self.preprocess = open_clip.create_model_from_pretrained(
-                model_name, device=self.device
-            )
+            with _torch_load_open_clip_bin_checkpoints_ok():
+                self.model, self.preprocess = open_clip.create_model_from_pretrained(
+                    model_name, device=self.device
+                )
             self.tokenizer = open_clip.get_tokenizer(model_name)
         self.positive_texts = [
             "a hand holding an object",
