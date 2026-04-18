@@ -212,7 +212,7 @@ def update_catalog_device(
         if not quiet:
             print(f"    (dry-run) device {old!r} → {device!r}")
         return True
-    with open(catalog_path, encoding="utf-8") as f:
+    with open(catalog_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
     if not quiet:
