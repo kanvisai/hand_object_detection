@@ -1136,6 +1136,20 @@ class Florence2HandClassifier(YesNoTextMixin):
         self.model.eval()
         self.last_debug = ""
 
+    def _inputs_to_model_device_dtype(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Convivencia fp16/fp32: processor suele dar float32; pesos pueden ser half en CUDA."""
+        param_dtype = next(self.model.parameters()).dtype
+        out: dict[str, Any] = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                if v.is_floating_point():
+                    out[k] = v.to(device=self.device, dtype=param_dtype)
+                else:
+                    out[k] = v.to(self.device)
+            else:
+                out[k] = v
+        return out
+
     def predict_yes_prob(
         self,
         bgr: np.ndarray,
@@ -1148,7 +1162,7 @@ class Florence2HandClassifier(YesNoTextMixin):
         score: float | None = None
         with torch.no_grad():
             inputs = self.processor(images=image, text=self.prompt, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = self._inputs_to_model_device_dtype(inputs)
             t0 = time.perf_counter()
             # Respuestas cortas tipo Yes/No; ~12 tokens bastan sin invitar tanto a repetir la pregunta como con 32.
             out_ids = self.model.generate(**inputs, max_new_tokens=12, do_sample=False, num_beams=1)
@@ -1175,7 +1189,7 @@ class Florence2HandClassifier(YesNoTextMixin):
                 inputs2 = self.processor(
                     images=image, text=_FLORENCE_ECHO_FALLBACK_PROMPT, return_tensors="pt"
                 )
-                inputs2 = {k: v.to(self.device) for k, v in inputs2.items()}
+                inputs2 = self._inputs_to_model_device_dtype(inputs2)
                 out_ids2 = self.model.generate(**inputs2, max_new_tokens=12, do_sample=False, num_beams=1)
                 latency2 = time.perf_counter() - t1
                 out2 = self.processor.batch_decode(

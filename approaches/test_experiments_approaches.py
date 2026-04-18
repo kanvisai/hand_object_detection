@@ -13,6 +13,10 @@ Fase 3 opcional (--phase3-parallel-sweep o --only-phase3): el mismo approach y u
 en paralelo. Por defecto barrido adaptativo (dobla N y refina por búsqueda binaria) hasta fallo, OOM o
 tope --phase3-max-parallel. Con --phase3-sweep-mode fixed se usa --phase3-steps. Ver phase3_parallel_sweep_summary.json.
 
+Fase 4 (--phase4-parallel-sweep o --only-phase4): repite el barrido de fase 3 para cada approach del
+catálogo (mismo vídeo y perfil), estima N máximo por modelo y agrega min/mediana/max de latency_sec en
+vlm_calls y tiempo pipeline vs duración del clip. Ver phase4_parallel_sweep_summary.json.
+
 Modo sin ventana: fase1/2/3 no pasan --save (sin vídeo de salida; solo métricas; alineado a escenario
 producción sin grabar). No se usa cv2.imshow. Entorno headless
 MPLBACKEND=Agg. No forzar QT_QPA_PLATFORM=offscreen: muchos paquetes opencv solo traen el plugin
@@ -25,6 +29,7 @@ import gc
 import json
 import math
 import re
+import statistics
 import socket
 import sys
 import threading
@@ -1161,6 +1166,7 @@ def run_phase3_parallel_sweep(
     pause_sec: float = 2.0,
     min_free_ram_mib: int = 512,
     stream_log: tuple[TextIO, threading.Lock] | None = None,
+    sweep_dir: Path | None = None,
 ) -> dict[str, Any]:
     """
     Fase 3: N subprocesos = N flujos. Modo `fixed`: N recorre n_steps. Modo `adaptive`: dobla N
@@ -1175,9 +1181,6 @@ def run_phase3_parallel_sweep(
     if ap_obj.get("vlm_model"):
         merged_base["vlm_model"] = ap_obj["vlm_model"]
 
-    sweep_dir = campaign_dir / "phase3_parallel_sweep"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-
     if sweep_mode not in ("adaptive", "fixed"):
         raise RuntimeError("sweep_mode debe ser 'adaptive' o 'fixed'")
     if sweep_mode == "fixed":
@@ -1188,6 +1191,9 @@ def run_phase3_parallel_sweep(
         n_sorted = []
     st0 = max(1, int(start_n))
     cap = max(1, int(max_parallel))
+
+    sweep_root = Path(sweep_dir) if sweep_dir is not None else (campaign_dir / "phase3_parallel_sweep")
+    sweep_root.mkdir(parents=True, exist_ok=True)
 
     step_results: list[dict[str, Any]] = []
     n_tried_order: list[int] = []
@@ -1244,7 +1250,7 @@ def run_phase3_parallel_sweep(
             if _low_ram_block(N):
                 stop_sweep = "low_host_ram"
                 break
-            sdir = sweep_dir / f"n_parallel_{N:03d}"
+            sdir = sweep_root / f"n_parallel_{N:03d}"
             st, all_ok, oom = _phase3_execute_n_batch(
                 N,
                 sdir,
@@ -1276,7 +1282,7 @@ def run_phase3_parallel_sweep(
                 stop_sweep = "low_host_ram"
                 first_fail_n = N
                 break
-            sdir = sweep_dir / f"n_parallel_{N:03d}"
+            sdir = sweep_root / f"n_parallel_{N:03d}"
             st, all_ok, oom = _phase3_execute_n_batch(
                 N,
                 sdir,
@@ -1320,7 +1326,7 @@ def run_phase3_parallel_sweep(
                 if _low_ram_block(m):
                     stop_sweep = "low_host_ram"
                     break
-                sdir2 = sweep_dir / f"n_parallel_{m:03d}"
+                sdir2 = sweep_root / f"n_parallel_{m:03d}"
                 st2, oka, oom2 = _phase3_execute_n_batch(
                     m,
                     sdir2,
@@ -1369,6 +1375,7 @@ def run_phase3_parallel_sweep(
             "Barrido: mismo vídeo, mismo approach. N subprocesos = N 'flujos' aislados. "
             "Modo adaptativo: exponencial + búsqueda binaria. Entre lotes: gc + empty_cache + pausa."
         ),
+        "sweep_output_dir": str(sweep_root.resolve()),
         "sweep_mode": sweep_mode,
         "approach_id": approach_id,
         "profile_id": profile_id,
@@ -1458,6 +1465,249 @@ def _phase3_run_write(
         json.dump(p3, jf, indent=2, ensure_ascii=False)
     print(f"[ok] Fase 3: {p3p}")
     return p3
+
+
+def _resolve_phase4_video_path(args: Any, catalog: dict[str, Any]) -> Path | None:
+    pv = getattr(args, "phase4_video", None)
+    if pv and Path(str(pv)).expanduser().is_file():
+        return Path(str(pv)).expanduser().resolve()
+    return _resolve_phase3_video_path(args, catalog)
+
+
+def _resolve_phase4_profile_id(args: Any, campaign_dir: Path) -> str | None:
+    p = (getattr(args, "phase4_profile", None) or "").strip()
+    if p:
+        return p
+    p1 = campaign_dir / "phase1_summary.json"
+    if p1.is_file():
+        try:
+            with open(p1, encoding="utf-8") as f:
+                d = json.load(f)
+            rows = d.get("ranking_median_by_approach_best_profile") or []
+            if rows and rows[0].get("profile_id"):
+                return str(rows[0]["profile_id"])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _metrics_path_n1_first_ok(sweep_inner: dict[str, Any]) -> Path | None:
+    """metrics.json del primer lote N=1 con todos los runs OK."""
+    for step in sweep_inner.get("steps") or []:
+        if step.get("skipped"):
+            continue
+        if int(step.get("n_parallel") or 0) != 1:
+            continue
+        if not step.get("all_success"):
+            continue
+        runs = step.get("runs") or []
+        if not runs:
+            continue
+        rd = runs[0].get("run_dir")
+        if not rd:
+            continue
+        mp = Path(str(rd)) / "metrics.json"
+        if mp.is_file():
+            return mp
+    return None
+
+
+def _latency_and_pipeline_from_metrics(metrics_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Estadísticas vlm_calls + tiempos pipeline para contestar ~cuánto son 10s de vídeo."""
+    try:
+        with open(metrics_path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return (
+            {"error": str(e), "source_metrics_json": str(metrics_path)},
+            {},
+        )
+    report = enrich_pipeline_report(raw)
+    calls = report.get("vlm_calls") or []
+    lat = [float(c["latency_sec"]) for c in calls if c.get("latency_sec") is not None]
+    latency_block: dict[str, Any] = {
+        "source_metrics_json": str(metrics_path.resolve()),
+        "note": "min/mediana/max sobre vlm_calls[].latency_sec del run N=1 (un proceso aislado).",
+        "count": len(lat),
+        "min_sec": round(min(lat), 6) if lat else None,
+        "median_sec": round(statistics.median(lat), 6) if lat else None,
+        "max_sec": round(max(lat), 6) if lat else None,
+        "vlm_latency_mean_sec": report.get("vlm_latency_mean_sec"),
+        "derived_vlm_mean_latency_ms": report.get("derived_vlm_mean_latency_ms"),
+    }
+    wall = report.get("wall_clock_processing_sec")
+    dur = report.get("video_duration_sec") or report.get("video_duration_sec_metadata")
+    pipe: dict[str, Any] = {
+        "wall_clock_processing_sec": wall,
+        "video_duration_sec": float(dur) if dur is not None else None,
+        "derived_wall_clock_per_10s_video_sec": None,
+        "derived_ranking_score": report.get("derived_ranking_score"),
+    }
+    if wall is not None and dur is not None and float(dur) > 0:
+        pipe["derived_wall_clock_per_10s_video_sec"] = round(float(wall) / float(dur) * 10.0, 6)
+    return latency_block, pipe
+
+
+def run_phase4_multi_model_sweep(
+    catalog: dict[str, Any],
+    campaign_dir: Path,
+    video_path: Path,
+    profile_id: str,
+    args: Any,
+    monitor_psutil: bool,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+) -> dict[str, Any]:
+    """
+    Para cada approach del catálogo: mismo barrido que fase 3 (subcarpeta phase4_parallel_sweep/<id>/).
+    """
+    sm = (getattr(args, "phase3_sweep_mode", "adaptive") or "adaptive").strip().lower()
+    if sm not in ("adaptive", "fixed"):
+        sm = "adaptive"
+    n_steps: list[int] | None
+    if sm == "fixed":
+        n_steps = _parse_phase3_steps_str(str(args.phase3_steps or ""))
+        if not n_steps:
+            raise RuntimeError("fase 4 modo fixed: --phase3-steps sin enteros válidos.")
+    else:
+        n_steps = None
+
+    approaches = catalog.get("approaches") or []
+    models: list[dict[str, Any]] = []
+
+    for ap_entry in approaches:
+        aid = str(ap_entry.get("id") or "").strip()
+        if not aid:
+            continue
+        script_n = str(ap_entry.get("script") or "")
+        sweep_sub = campaign_dir / "phase4_parallel_sweep" / _sanitize_id(aid)
+        entry: dict[str, Any] = {
+            "approach_id": aid,
+            "script": script_n,
+            "vlm_model": ap_entry.get("vlm_model"),
+            "profile_id": profile_id,
+            "sweep_dir": str(sweep_sub.resolve()),
+        }
+        print(f"[phase4] --- {aid} ({script_n}) perfil={profile_id} ---", flush=True)
+        try:
+            p_inner = run_phase3_parallel_sweep(
+                catalog,
+                campaign_dir,
+                aid,
+                profile_id,
+                video_path,
+                n_steps,
+                monitor_psutil,
+                sweep_mode=sm,
+                start_n=int(getattr(args, "phase3_start_n", 1) or 1),
+                max_parallel=int(getattr(args, "phase3_max_parallel", 64) or 64),
+                pause_sec=float(args.phase3_pause_sec),
+                min_free_ram_mib=int(args.phase3_min_free_ram_mib),
+                stream_log=stream_log,
+                sweep_dir=sweep_sub,
+            )
+            frag = sweep_sub / "parallel_sweep_detail.json"
+            with open(frag, "w", encoding="utf-8") as jf:
+                json.dump(p_inner, jf, indent=2, ensure_ascii=False)
+
+            mp = _metrics_path_n1_first_ok(p_inner)
+            if mp is not None:
+                lat_b, pipe_b = _latency_and_pipeline_from_metrics(mp)
+                entry["latency_vlm_calls"] = lat_b
+                entry["pipeline_single_stream"] = pipe_b
+            else:
+                entry["latency_vlm_calls"] = {
+                    "note": "No hubo lote N=1 con todos los runs OK o falta metrics.json.",
+                }
+                entry["pipeline_single_stream"] = {}
+
+            entry["last_fully_successful_n_parallel"] = p_inner.get("last_fully_successful_n_parallel")
+            entry["sweep_ended_because"] = p_inner.get("sweep_ended_because")
+            entry["n_steps_tried"] = p_inner.get("n_steps_tried")
+            entry["parallel_sweep_detail_json"] = str(frag.resolve())
+            models.append(entry)
+        except Exception as exc:  # pragma: no cover
+            models.append(
+                {
+                    "approach_id": aid,
+                    "script": script_n,
+                    "profile_id": profile_id,
+                    "error": repr(exc),
+                }
+            )
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        time.sleep(max(0.0, float(getattr(args, "phase3_pause_sec", 2.0))))
+
+    return {
+        "generated_utc": _utc_iso(),
+        "phase": 4,
+        "file_role": (
+            "Resumen fase 4: barrido paralelo N por cada approach (mismo vídeo y perfil). "
+            "Models[] incluye phase3_style_summary y latency_vlm_calls desde run N=1 si existió. "
+            "derived_wall_clock_per_10s_video_sec ≈ tiempo de pipeline para 10 s de vídeo real "
+            "(mismo cociente wall/duración × 10)."
+        ),
+        "video_path": str(video_path.resolve()),
+        "profile_id": profile_id,
+        "phase3_sweep_params_reused": {
+            "phase3_sweep_mode": sm,
+            "phase3_steps": str(getattr(args, "phase3_steps", "")),
+            "phase3_start_n": int(getattr(args, "phase3_start_n", 1) or 1),
+            "phase3_max_parallel": int(getattr(args, "phase3_max_parallel", 64) or 64),
+            "phase3_pause_sec": float(args.phase3_pause_sec),
+            "phase3_min_free_ram_mib": int(args.phase3_min_free_ram_mib),
+        },
+        "metrics_glossary": {
+            "latency_vlm_calls.min_sec": "Mínimo latency_sec entre llamadas al clasificador en el run N=1.",
+            "latency_vlm_calls.median_sec": "Mediana de latency_sec (vlm_calls).",
+            "pipeline_single_stream.derived_wall_clock_per_10s_video_sec": (
+                "wall_clock_processing_sec / video_duration_sec × 10; orden de magnitud para procesar 10 s de clip."
+            ),
+            "last_fully_successful_n_parallel": "Igual que fase 3: máximo N con todos los subprocesos OK sin OOM.",
+        },
+        "models": models,
+    }
+
+
+def _phase4_run_write(
+    catalog: dict[str, Any],
+    campaign_dir: Path,
+    video_path: Path,
+    profile_id: str,
+    args: Any,
+    monitor_psutil: bool,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+) -> dict[str, Any] | None:
+    """Ejecuta fase 4 y escribe phase4_parallel_sweep_summary.json."""
+    if not video_path or not video_path.is_file():
+        print("[phase4] Omitido: vídeo inválido.", file=sys.stderr)
+        return None
+    if not profile_id:
+        print("[phase4] Omitido: falta profile_id.", file=sys.stderr)
+        return None
+    t0 = time.perf_counter()
+    p4 = run_phase4_multi_model_sweep(
+        catalog,
+        campaign_dir,
+        video_path,
+        profile_id,
+        args,
+        monitor_psutil,
+        stream_log=stream_log,
+    )
+    p4["phase4_orchestrator_wall_sec"] = round(time.perf_counter() - t0, 3)
+    out_p = campaign_dir / "phase4_parallel_sweep_summary.json"
+    with open(out_p, "w", encoding="utf-8") as jf:
+        json.dump(p4, jf, indent=2, ensure_ascii=False)
+    print(f"[ok] Fase 4: {out_p}")
+    return p4
 
 
 def main() -> None:
@@ -1564,7 +1814,32 @@ def main() -> None:
         metavar="M",
         help="No lanzar un lote N si available RAM < M MiB (host). 0=desactivar comprobación.",
     )
+    ap.add_argument(
+        "--only-phase4",
+        action="store_true",
+        help="Solo fase 4: barrido N por cada approach del catálogo; requiere --campaign y vídeo válido.",
+    )
+    ap.add_argument(
+        "--phase4-parallel-sweep",
+        action="store_true",
+        help="Tras fase 1/2/(3), ejecuta fase 4 (todos los modelos × mismo vídeo/perfil).",
+    )
+    ap.add_argument(
+        "--phase4-profile",
+        default="",
+        help="Perfil catálogo para todos los approaches en fase 4; si vacío: primero del ranking en phase1_summary o stride_5.",
+    )
+    ap.add_argument(
+        "--phase4-video",
+        type=Path,
+        default=None,
+        help="Mp4 para fase 4; si vacío se usa --phase3-video o el vídeo de screening del catálogo.",
+    )
     args = ap.parse_args()
+
+    if bool(getattr(args, "only_phase4", False)) and bool(getattr(args, "only_phase3", False)):
+        print("[error] Elige solo uno: --only-phase4 o --only-phase3.", file=sys.stderr)
+        raise SystemExit(2)
 
     catalog_path = args.catalog.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
@@ -1587,6 +1862,47 @@ def main() -> None:
         catalog["videos"] = kept
         if not kept:
             raise RuntimeError("Tras --skip-missing-videos no queda ningun video en el catalogo.")
+
+    if args.only_phase4:
+        if not args.campaign.strip() and not args.unique_campaign:
+            print(
+                "[error] --only-phase4 requiere --campaign (carpeta existente bajo --output-root).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if not campaign_dir.is_dir():
+            print(f"[error] no existe la campaña: {campaign_dir}", file=sys.stderr)
+            raise SystemExit(1)
+        pid4 = _resolve_phase4_profile_id(args, campaign_dir) or "stride_5"
+        if not (args.phase4_profile or "").strip():
+            print(f"[phase4] --phase4-profile vacío; usando {pid4!r}.")
+        vpick = _resolve_phase4_video_path(args, catalog)
+        if vpick is None or not vpick.is_file():
+            print("[error] Ningún vídeo válido para fase 4. Usa --phase4-video o --phase3-video.", file=sys.stderr)
+            raise SystemExit(1)
+        if (args.phase3_sweep_mode or "adaptive") == "fixed" and not _parse_phase3_steps_str(
+            str(args.phase3_steps or "")
+        ):
+            print(
+                "[error] --phase3-sweep-mode fixed requiere --phase3-steps con al menos un entero > 0.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        p4m = not args.no_psutil and psutil is not None
+        if (
+            _phase4_run_write(
+                catalog,
+                campaign_dir,
+                vpick,
+                pid4,
+                args,
+                p4m,
+                None,
+            )
+            is None
+        ):
+            raise SystemExit(1)
+        return
 
     if args.only_phase3:
         if not args.campaign.strip() and not args.unique_campaign:
@@ -1910,6 +2226,34 @@ def main() -> None:
                     monitor,
                     session_log_tuple,
                 )
+
+        if getattr(args, "phase4_parallel_sweep", False):
+            v4b = _resolve_phase4_video_path(args, catalog)
+            pid4 = (args.phase4_profile or "").strip() or (
+                str(ranked[0]["profile_id"]) if ranked and ranked[0].get("profile_id") else ""
+            )
+            if not pid4:
+                pid4 = _resolve_phase4_profile_id(args, campaign_dir) or "stride_5"
+                print(f"[phase4] perfil desde defecto del catálogo/ranking: {pid4!r}")
+            if (args.phase3_sweep_mode or "adaptive") == "fixed" and not _parse_phase3_steps_str(
+                str(args.phase3_steps or "")
+            ):
+                print(
+                    "[phase4] Modo fixed omitido (--phase3-steps vacío). No ejecuto fase 4.",
+                    file=sys.stderr,
+                )
+            elif v4b and v4b.is_file():
+                _phase4_run_write(
+                    catalog,
+                    campaign_dir,
+                    v4b,
+                    pid4,
+                    args,
+                    monitor,
+                    session_log_tuple,
+                )
+            else:
+                print("[phase4] Omitido: vídeo no válido.", file=sys.stderr)
 
         # Si hubo excepcion antes, este bloque no corre (no aparece FINALIZADO en el log).
         orch_end = _utc_iso()
