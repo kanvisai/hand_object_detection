@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import re
 import statistics
@@ -34,6 +35,26 @@ if str(_APPROACHES_DIR) not in sys.path:
     sys.path.insert(0, str(_APPROACHES_DIR))
 
 from yolo_weights_download import YOLO_PT_DOWNLOAD_URL, download_yolo_pt_if_missing
+
+
+def _terminal_frame_progress_line(label: str, video_path: Path, frame_i: int, total_frames: int) -> None:
+    """Una linea con \\r: misma logica que la barra usada con --save (vista en headless / orquestador)."""
+    if total_frames > 0:
+        pct = min(100.0, (100.0 * frame_i) / max(1, total_frames))
+        bar_w = 28
+        fill = int(round((pct / 100.0) * bar_w))
+        bar = ("#" * fill) + ("-" * (bar_w - fill))
+        print(
+            f"\r{label} {video_path.name} [{bar}] {frame_i}/{total_frames} ({pct:5.1f}%)",
+            end="",
+            flush=True,
+        )
+    else:
+        print(
+            f"\r{label} {video_path.name} frames={frame_i}",
+            end="",
+            flush=True,
+        )
 
 import cv2
 import numpy as np
@@ -895,10 +916,11 @@ def run_pipeline(
     personal_trt = _weights_is_tensorrt(str(args.personal_weights))
     predict_dev = yolo_predict_device_for_args(args)
 
-    pose_model = YOLO(args.pose_weights)
+    # task explícito evita el aviso "Unable to automatically guess model task" de ultralytics
+    pose_model = YOLO(str(args.pose_weights), task="pose")
     if args.device and not pose_trt:
         pose_model.to(args.device)
-    personal_model = YOLO(args.personal_weights)
+    personal_model = YOLO(str(args.personal_weights), task="detect")
     if args.device and not personal_trt:
         personal_model.to(args.device)
 
@@ -1387,29 +1409,17 @@ def run_pipeline(
                 else:
                     out_frame = vis
                 writer.write(out_frame)
-                # Barra de progreso en terminal al guardar video.
-                if total_frames > 0:
-                    pct = min(100.0, (100.0 * frame_i) / max(1, total_frames))
-                    bar_w = 28
-                    fill = int(round((pct / 100.0) * bar_w))
-                    bar = ("#" * fill) + ("-" * (bar_w - fill))
-                    print(
-                        f"\r[save] {video_path.name} [{bar}] {frame_i}/{total_frames} ({pct:5.1f}%)",
-                        end="",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"\r[save] {video_path.name} frames={frame_i}",
-                        end="",
-                        flush=True,
-                    )
+                _terminal_frame_progress_line("[save]", video_path, frame_i, total_frames)
             else:
-                vis = cv2.resize(vis, (view_w, view_h), interpolation=cv2.INTER_AREA)
-                cv2.imshow(window_title, vis)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q"), ord("Q")):
-                    break
+                if os.environ.get("DISPLAY", "").strip():
+                    vis = cv2.resize(vis, (view_w, view_h), interpolation=cv2.INTER_AREA)
+                    cv2.imshow(window_title, vis)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q"), ord("Q")):
+                        break
+                else:
+                    # Sin --save (orquestador) y sin X11: la barra [save] no se imprimia; replicar en [run]
+                    _terminal_frame_progress_line("[run]", video_path, frame_i, total_frames)
 
         if gpu_poller is not None:
             gpu_poller.stop()
@@ -1426,7 +1436,11 @@ def run_pipeline(
         cap.release()
         if writer is not None:
             writer.release()
-            print()  # salto de línea tras barra de progreso
+        if writer is not None or (
+            not str(save_path).strip() and not os.environ.get("DISPLAY", "").strip()
+        ):
+            # Nueva linea tras [save] o [run] (misma consola, \\r)
+            print()
         cv2.destroyAllWindows()
 
         out_dir_s = str(args.output).strip()

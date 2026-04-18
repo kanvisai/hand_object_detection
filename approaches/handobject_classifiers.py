@@ -1178,7 +1178,10 @@ class ClipLikeClassifier(YesNoTextMixin):
             device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
         )
         load_id = resolve_hf_model_ref(model_name)
-        self.processor = AutoProcessor.from_pretrained(load_id)
+        try:
+            self.processor = AutoProcessor.from_pretrained(load_id, use_fast=True)
+        except (TypeError, ValueError, OSError):
+            self.processor = AutoProcessor.from_pretrained(load_id)
         self.model = AutoModel.from_pretrained(load_id).to(self.device)
         self.model.eval()
         self.positive_texts = [

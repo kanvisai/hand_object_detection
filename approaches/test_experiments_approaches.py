@@ -15,7 +15,8 @@ tope --phase3-max-parallel. Con --phase3-sweep-mode fixed se usa --phase3-steps.
 
 Modo sin ventana: fase1/2/3 no pasan --save (sin vídeo de salida; solo métricas; alineado a escenario
 producción sin grabar). No se usa cv2.imshow. Entorno headless
-(QT_QPA_PLATFORM=offscreen, MPLBACKEND=Agg) para evitar GUI accidental en segundo plano.
+MPLBACKEND=Agg. No forzar QT_QPA_PLATFORM=offscreen: muchos paquetes opencv solo traen el plugin
+Qt xcb; forzar "offscreen" inexistente llena el log de errores. Sin DISPLAY, usar opencv-python-headless o xvfb.
 """
 from __future__ import annotations
 
@@ -293,10 +294,20 @@ def enrich_pipeline_report(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _headless_env(base: dict[str, str]) -> dict[str, str]:
-    """Evita backends GUI (Qt/mpl) cuando se ejecuta sin pantalla / en batch."""
+    """
+    Entorno de hijos: matplotlib sin display.
+    No fijar QT_QPA_PLATFORM=offscreen: la build típica de opencv-python solo incluye el plugin
+    "xcb" bajo site-packages/cv2/qt; pedir "offscreen" hace que Qt falle aunque el run siga.
+    Con DISPLAY, xcb es aceptable; el usuario puede exportar otra plataforma antes de invocar al orquestador.
+    """
     env = dict(base)
-    env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("MPLBACKEND", "Agg")
+    if (
+        "QT_QPA_PLATFORM" not in base
+        and "QT_QPA_PLATFORM" not in env
+        and (base.get("DISPLAY") or os.environ.get("DISPLAY"))
+    ):
+        env.setdefault("QT_QPA_PLATFORM", "xcb")
     return env
 
 
