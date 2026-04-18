@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Orquesta experimentos mano-objeto: recorre approaches (test_new_handobject_*.py) x perfiles x videos,
-volcando JSON enriquecido + video bajo output_results/. Tras la fase 1, opcionalmente lanza
-fase 2: 2 mejores modelos, N videos en paralelo (cada modelo en su tanda).
+volcando JSON enriquecido + video bajo output_results/. Cada ejecución escribe también
+output_results/<campaña>/logs/orchestrator_<UTC>.log (salida del orquestador + stdout/stderr de cada hijo).
+
+Tras la fase 1, opcionalmente lanza fase 2: 2 mejores modelos, N videos en paralelo (cada modelo en su tanda).
 
 Modo sin ventana: cada run pasa --save (video en disco); no se usa cv2.imshow. Entorno headless
 (QT_QPA_PLATFORM=offscreen, MPLBACKEND=Agg) para evitar GUI accidental en segundo plano.
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Any
+from typing import Any, TextIO
 
 # paquetes opcionales
 try:
@@ -35,6 +37,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 APPROACHES_DIR = Path(__file__).resolve().parent
 DEFAULT_CATALOG = APPROACHES_DIR / "experiments_catalog.json"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output_results"
+
+
+class _TeeIO:
+    """Duplica escritura en terminal y fichero de log."""
+
+    def __init__(self, *streams: TextIO):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            s.flush()
+
+    def isatty(self) -> bool:
+        return False
 
 
 def _utc_iso() -> str:
@@ -255,6 +277,9 @@ def run_single_experiment(
     spec: RunSpec,
     run_dir: Path,
     monitor_psutil: bool,
+    *,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+    run_label: str = "",
 ) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.json"
@@ -290,7 +315,42 @@ def run_single_experiment(
 
     th = threading.Thread(target=_monitor, daemon=True)
     th.start()
-    out_b, err_b = proc.communicate()
+
+    lb = run_label.strip()
+    prefix = (lb + " ") if lb else ""
+
+    if stream_log is None:
+        out_b, err_b = proc.communicate()
+        out_b = out_b or ""
+        err_b = err_b or ""
+    else:
+        log_fp, log_lock = stream_log
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+
+        def _drain(pipe: Any, chunks: list[str], tag: str) -> None:
+            try:
+                for line in iter(pipe.readline, ""):
+                    chunks.append(line)
+                    block = f"{prefix}[{tag}] {line}"
+                    sys.stdout.write(block)
+                    sys.stdout.flush()
+                    with log_lock:
+                        log_fp.write(block)
+                        log_fp.flush()
+            finally:
+                pipe.close()
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks, "stdout"))
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks, "stderr"))
+        t_out.start()
+        t_err.start()
+        proc.wait()
+        t_out.join()
+        t_err.join()
+        out_b = "".join(out_chunks)
+        err_b = "".join(err_chunks)
+
     mon_stop.set()
     th.join(timeout=1.0)
     wall = time.perf_counter() - t0
@@ -415,6 +475,8 @@ def phase2_parallel_batch(
     videos: list[Path],
     workers: int,
     monitor_psutil: bool,
+    *,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
 ) -> dict[str, Any]:
     """Ejecuta cada modelo del top2: todos los videos a la vez (workers = len(videos))."""
     results_by_model: list[dict[str, Any]] = []
@@ -442,7 +504,14 @@ def phase2_parallel_batch(
                 merged_args=dict(merged_base),
                 vlm_model_override=ap_obj.get("vlm_model"),
             )
-            return run_single_experiment(spec, rd, monitor_psutil=monitor_psutil)
+            lbl = f"[fase2 rank{rank} {aid}/{pid} video={vp.name}]"
+            return run_single_experiment(
+                spec,
+                rd,
+                monitor_psutil=monitor_psutil,
+                stream_log=stream_log,
+                run_label=lbl,
+            )
 
         batch_t0 = time.perf_counter()
         parallel_out: list[dict[str, Any]] = []
@@ -506,6 +575,11 @@ def main() -> None:
         action="store_true",
         help="Crea una subcarpeta automática run_YYYYMMDDTHHMMSS (UTC) como --campaign.",
     )
+    ap.add_argument(
+        "--no-session-log",
+        action="store_true",
+        help="No crear output_results/.../logs/orchestrator_*.log ni duplicar salida.",
+    )
     args = ap.parse_args()
 
     catalog_path = args.catalog.expanduser().resolve()
@@ -550,105 +624,143 @@ def main() -> None:
         return
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[campaña] salida en: {campaign_dir}")
 
-    phase1_dir = campaign_dir / "phase1_runs"
-    phase1_dir.mkdir(parents=True, exist_ok=True)
+    _orig_stdout = sys.stdout
+    _log_fp: TextIO | None = None
+    _log_lock = threading.Lock()
+    session_log_tuple: tuple[TextIO, threading.Lock] | None = None
+    session_log_path: Path | None = None
 
-    monitor = not args.no_psutil and psutil is not None
-
-    run_results: list[dict[str, Any]] = []
-    for i, spec in enumerate(runs, start=1):
-        run_id = _sanitize_id(f"{spec.approach_id}__{spec.profile_id}__{spec.video_path.stem}")
-        run_dir = phase1_dir / run_id
-        summary_file = run_dir / "experiment_summary.json"
-        if args.resume and summary_file.exists():
-            try:
-                with open(summary_file, encoding="utf-8") as jf:
-                    cached = json.load(jf)
-                env = cached.get("envelope") or {}
-                pl = cached.get("pipeline") or {}
-                run_results.append(
-                    {
-                        "run_dir": str(run_dir),
-                        "summary_json": str(summary_file),
-                        "approach_id": spec.approach_id,
-                        "profile_id": spec.profile_id,
-                        "video_path": str(spec.video_path.resolve()),
-                        "success": bool(env.get("ok")),
-                        "derived_ranking_score": pl.get("derived_ranking_score"),
-                        "wall_clock_processing_sec": pl.get("wall_clock_processing_sec"),
-                        "video_duration_sec": pl.get("video_duration_sec_metadata"),
-                    }
-                )
-                print(f"[resume] {i}/{len(runs)} {run_id}")
-                continue
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        print(f"[run] {i}/{len(runs)} {run_id}")
-        res = run_single_experiment(spec, run_dir, monitor_psutil=monitor)
-        run_results.append(res)
-
-    ranked, top2 = rank_approaches_for_phase2(run_results)
-
-    phase1_summary = {
-        "generated_utc": _utc_iso(),
-        "catalog_path": str(catalog_path),
-        "output_root": str(output_root),
-        "campaign_dir": str(campaign_dir),
-        "campaign_name": campaign_name or None,
-        "experiment_strategy": catalog.get("experiment_strategy", "full_matrix"),
-        "screening_video_index": catalog.get("screening_video_index"),
-        "phase1_screening_note": (
-            "single_video_screening: fase 1 solo barrido approaches×perfiles sobre un clip; "
-            "fase 2 valida los top modelos en todos los videos listados."
-            if catalog.get("experiment_strategy") == "single_video_screening"
-            else ""
-        ),
-        "total_runs": len(runs),
-        "runs": run_results,
-        "ranking_median_by_approach_best_profile": ranked,
-        "phase2_top2": top2,
-        "metrics_glossary": {
-            "derived_ranking_score": "wall_clock_processing_sec / video_duration_sec_metadata (menor = menos tiempo de proceso por segundo de video).",
-            "derived_vlm_compute_sum_sec": "Suma de latency_sec de todas las llamadas al clasificador (tiempo efectivo modelo).",
-            "derived_non_vlm_overhead_sec": "wall_clock - suma VLM (pose, decodificacion, escritura, etc.).",
-            "derived_wall_clock_per_video_second": "Igual que derived_ranking_score si el video se procesa entero.",
-            "vlm_inference_count": "Numero de inferencias del clasificador en el clip.",
-            "processing_fps_effective": "frames_processed / wall_clock (pipeline).",
-            "realtime_factor_vs_video_fps": "video_fps / processing_fps_effective (<1 suele significar mas rapido que tiempo real).",
-            "torch_cuda_peak_memory_allocated_mib": "Pico VRAM PyTorch si device=cuda.",
-            "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi durante el run (solo CUDA).",
-            "host_peak_rss_bytes": "Pico RSS del proceso hijo (psutil, si disponible).",
-        },
-    }
-    summary_path = campaign_dir / "phase1_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as jf:
-        json.dump(phase1_summary, jf, indent=2, ensure_ascii=False)
-    print(f"[ok] Resumen fase 1: {summary_path}")
-
-    do_phase2 = bool(args.phase2)
-    if do_phase2 and len(top2) >= 1:
-        videos = [Path(v).expanduser() for v in catalog.get("videos") or []]
-        videos = [v for v in videos if v.exists()]
-        if not videos:
-            print("[phase2] Omitido: no hay videos existentes en el catalogo.")
-            return
-        p2 = phase2_parallel_batch(
-            catalog,
-            campaign_dir,
-            top2,
-            videos,
-            workers=min(args.phase2_workers, len(videos)),
-            monitor_psutil=monitor,
+    if not args.no_session_log:
+        log_dir = campaign_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        session_log_path = log_dir / (
+            "orchestrator_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".log"
         )
-        p2_path = campaign_dir / "phase2_parallel_summary.json"
-        with open(p2_path, "w", encoding="utf-8") as jf:
-            json.dump(p2, jf, indent=2, ensure_ascii=False)
-        print(f"[ok] Resumen fase 2: {p2_path}")
-    elif do_phase2:
-        print("[phase2] No hay al menos 2 modelos rankeables (revisa runs fallidos).")
+        _log_fp = open(session_log_path, "w", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeIO(_orig_stdout, _log_fp)
+        session_log_tuple = (_log_fp, _log_lock)
+        print(f"[orchestrator] log de sesión: {session_log_path.resolve()}")
+        print(f"[campaña] salida en: {campaign_dir}")
+    else:
+        print(f"[campaña] salida en: {campaign_dir}")
+
+    try:
+        phase1_dir = campaign_dir / "phase1_runs"
+        phase1_dir.mkdir(parents=True, exist_ok=True)
+
+        monitor = not args.no_psutil and psutil is not None
+
+        run_results: list[dict[str, Any]] = []
+        for i, spec in enumerate(runs, start=1):
+            run_id = _sanitize_id(f"{spec.approach_id}__{spec.profile_id}__{spec.video_path.stem}")
+            run_dir = phase1_dir / run_id
+            summary_file = run_dir / "experiment_summary.json"
+            if args.resume and summary_file.exists():
+                try:
+                    with open(summary_file, encoding="utf-8") as jf:
+                        cached = json.load(jf)
+                    env = cached.get("envelope") or {}
+                    pl = cached.get("pipeline") or {}
+                    run_results.append(
+                        {
+                            "run_dir": str(run_dir),
+                            "summary_json": str(summary_file),
+                            "approach_id": spec.approach_id,
+                            "profile_id": spec.profile_id,
+                            "video_path": str(spec.video_path.resolve()),
+                            "success": bool(env.get("ok")),
+                            "derived_ranking_score": pl.get("derived_ranking_score"),
+                            "wall_clock_processing_sec": pl.get("wall_clock_processing_sec"),
+                            "video_duration_sec": pl.get("video_duration_sec_metadata"),
+                        }
+                    )
+                    print(f"[resume] {i}/{len(runs)} {run_id}")
+                    continue
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            print(f"[run] {i}/{len(runs)} {run_id}")
+            lbl = f"[fase1 {i}/{len(runs)} {run_id}]"
+            res = run_single_experiment(
+                spec,
+                run_dir,
+                monitor_psutil=monitor,
+                stream_log=session_log_tuple,
+                run_label=lbl,
+            )
+            run_results.append(res)
+
+        ranked, top2 = rank_approaches_for_phase2(run_results)
+
+        phase1_summary = {
+            "generated_utc": _utc_iso(),
+            "catalog_path": str(catalog_path),
+            "output_root": str(output_root),
+            "campaign_dir": str(campaign_dir),
+            "campaign_name": campaign_name or None,
+            "orchestrator_session_log": str(session_log_path.resolve())
+            if session_log_path
+            else None,
+            "experiment_strategy": catalog.get("experiment_strategy", "full_matrix"),
+            "screening_video_index": catalog.get("screening_video_index"),
+            "phase1_screening_note": (
+                "single_video_screening: fase 1 solo barrido approaches×perfiles sobre un clip; "
+                "fase 2 valida los top modelos en todos los videos listados."
+                if catalog.get("experiment_strategy") == "single_video_screening"
+                else ""
+            ),
+            "total_runs": len(runs),
+            "runs": run_results,
+            "ranking_median_by_approach_best_profile": ranked,
+            "phase2_top2": top2,
+            "metrics_glossary": {
+                "derived_ranking_score": "wall_clock_processing_sec / video_duration_sec_metadata (menor = menos tiempo de proceso por segundo de video).",
+                "derived_vlm_compute_sum_sec": "Suma de latency_sec de todas las llamadas al clasificador (tiempo efectivo modelo).",
+                "derived_non_vlm_overhead_sec": "wall_clock - suma VLM (pose, decodificacion, escritura, etc.).",
+                "derived_wall_clock_per_video_second": "Igual que derived_ranking_score si el video se procesa entero.",
+                "vlm_inference_count": "Numero de inferencias del clasificador en el clip.",
+                "processing_fps_effective": "frames_processed / wall_clock (pipeline).",
+                "realtime_factor_vs_video_fps": "video_fps / processing_fps_effective (<1 suele significar mas rapido que tiempo real).",
+                "torch_cuda_peak_memory_allocated_mib": "Pico VRAM PyTorch si device=cuda.",
+                "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi durante el run (solo CUDA).",
+                "host_peak_rss_bytes": "Pico RSS del proceso hijo (psutil, si disponible).",
+            },
+        }
+        summary_path = campaign_dir / "phase1_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as jf:
+            json.dump(phase1_summary, jf, indent=2, ensure_ascii=False)
+        print(f"[ok] Resumen fase 1: {summary_path}")
+
+        do_phase2 = bool(args.phase2)
+        if do_phase2 and len(top2) >= 1:
+            videos = [Path(v).expanduser() for v in catalog.get("videos") or []]
+            videos = [v for v in videos if v.exists()]
+            if not videos:
+                print("[phase2] Omitido: no hay videos existentes en el catalogo.")
+            else:
+                p2 = phase2_parallel_batch(
+                    catalog,
+                    campaign_dir,
+                    top2,
+                    videos,
+                    workers=min(args.phase2_workers, len(videos)),
+                    monitor_psutil=monitor,
+                    stream_log=session_log_tuple,
+                )
+                if session_log_path:
+                    p2["orchestrator_session_log"] = str(session_log_path.resolve())
+                p2_path = campaign_dir / "phase2_parallel_summary.json"
+                with open(p2_path, "w", encoding="utf-8") as jf:
+                    json.dump(p2, jf, indent=2, ensure_ascii=False)
+                print(f"[ok] Resumen fase 2: {p2_path}")
+        elif do_phase2:
+            print("[phase2] No hay al menos 2 modelos rankeables (revisa runs fallidos).")
+
+    finally:
+        sys.stdout = _orig_stdout
+        if _log_fp is not None:
+            _log_fp.close()
 
 
 if __name__ == "__main__":
