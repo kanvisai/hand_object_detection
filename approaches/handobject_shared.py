@@ -302,6 +302,14 @@ def build_parser(
         default="",
         help="Ruta de salida para modo --video. Si se indica, guarda video y no abre ventana.",
     )
+    ap.add_argument(
+        "--display-sync-fps",
+        action="store_true",
+        help=(
+            "Solo ventana (sin --save): tras cada frame espera hasta alinear ~1/FPS del clip "
+            "(metadata); si no, la vista va al ritmo del procesamiento (acelerada si la GPU va sobrada)."
+        ),
+    )
     ap.add_argument("--wrist-conf-th", type=float, default=0.35)
     ap.add_argument("--elbow-conf-th", type=float, default=0.25)
     ap.add_argument("--crop-size", type=int, default=200, help="Tamano base de crop de mano.")
@@ -989,6 +997,7 @@ def run_pipeline(
             if not ok or frame is None:
                 break
             frame_i += 1
+            t_frame_start = time.perf_counter()
             vis = frame.copy()
             h, w = frame.shape[:2]
             roi_poly_i: np.ndarray | None = None
@@ -1414,6 +1423,15 @@ def run_pipeline(
                 if os.environ.get("DISPLAY", "").strip():
                     vis = cv2.resize(vis, (view_w, view_h), interpolation=cv2.INTER_AREA)
                     cv2.imshow(window_title, vis)
+                    if (
+                        getattr(args, "display_sync_fps", False)
+                        and fps_src > 0
+                        and not save_path
+                    ):
+                        spf = 1.0 / fps_src
+                        dt = time.perf_counter() - t_frame_start
+                        if dt < spf:
+                            time.sleep(spf - dt)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q"), ord("Q")):
                         break

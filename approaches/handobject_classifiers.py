@@ -67,7 +67,8 @@ def _hf_repo_id_from_snapshot_cache_path(snapshot_dir: Path) -> str | None:
     for _ in range(14):
         p = cur.parent
         if cur.name and p.name == "snapshots" and p.parent and p.parent.name.startswith("models--"):
-            mname = p.parent.name[9:]
+            # "models--" tiene 8 caracteres; [9:] cortaba la 1ª letra del org (p.ej. U de UCSC).
+            mname = p.parent.name[len("models--") :]
             if "--" in mname:
                 org, repo = mname.split("--", 1)
                 return f"{org}/{repo}"
