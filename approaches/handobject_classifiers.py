@@ -33,6 +33,28 @@ except ImportError:  # pragma: no cover
 from hf_model_paths import resolve_hf_model_ref
 
 
+def _openclip_arch_for_hf_snapshot(model_ref: str) -> str | None:
+    """
+    Si model_ref describe un modelo MobileCLIP en Hugging Face, devuelve el nombre de arquitectura
+    esperado por open_clip (p. ej. MobileCLIP-S1). None si no es MobileCLIP (p. ej. otro Hub OpenCLIP).
+    """
+    s = str(model_ref).replace("hf-hub:", "").strip().lower()
+    if "mobileclip" not in s:
+        return None
+    if "mobileclip-b" in s or "mobileclip_b" in s:
+        return "MobileCLIP-B"
+    for i in (0, 1, 2):
+        tok = f"s{i}"
+        if (
+            f"mobileclip-{tok}" in s
+            or f"s{i}-openclip" in s
+            or f"/mobileclips{tok}" in s
+            or f"-s{i}-" in s
+        ):
+            return f"MobileCLIP-S{i}"
+    return "MobileCLIP-S1"
+
+
 def _internlm_past_seq_length(past_key_values: Any) -> int:
     """Longitud de secuencia en cache; tuple legacy o DynamicCache (K/V por capa pueden ser None al inicio)."""
     if past_key_values is None:
@@ -1211,11 +1233,22 @@ class OpenClipLikeClassifier(YesNoTextMixin):
             device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
         )
         load_ref = resolve_hf_model_ref(model_name)
-        if Path(load_ref).expanduser().is_dir():
+        root = Path(load_ref).expanduser()
+        # Snapshot HF local: open_clip espera nombre de arquitectura + pretrained=ruta (no solo la ruta).
+        if root.is_dir():
+            arch = _openclip_arch_for_hf_snapshot(model_name)
+            if arch is None:
+                raise RuntimeError(
+                    "Snapshot OpenCLIP local sin mapeo de arquitectura conocido; "
+                    f"path={root!s} model_ref={model_name!r}. "
+                    "Para MobileCLIP usa p. ej. hf-hub:apple/MobileCLIP-S1-OpenCLIP."
+                )
             self.model, self.preprocess = open_clip.create_model_from_pretrained(
-                load_ref, device=self.device
+                arch,
+                pretrained=str(root.resolve()),
+                device=self.device,
             )
-            self.tokenizer = open_clip.get_tokenizer(load_ref)
+            self.tokenizer = open_clip.get_tokenizer(arch)
         else:
             self.model, self.preprocess = open_clip.create_model_from_pretrained(
                 model_name, device=self.device
