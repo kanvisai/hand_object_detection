@@ -194,6 +194,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Rutas locales de snapshots HF (machine-specific); generado por check_models.py
+approaches/hf_model_paths.json
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
@@ -205,3 +208,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+*.safetensors
+*.pt
+*.engine
+*.model
+*.venv
+output/
+models/
