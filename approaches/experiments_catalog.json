@@ -18,10 +18,12 @@
     "max_track_lost": 20
   },
   "videos": [
-    "/home/debian/dev/Proyectos/GuardIA-Firmware/guardia-firmware/videos/test_coger/tipo_3/26/clip.mp4",
-    "/path/to/reemplazar_video_02.mp4",
-    "/path/to/reemplazar_video_03.mp4",
-    "/path/to/reemplazar_video_04.mp4"
+    "/home/angel/kanvis/hand_object_detection/videos/compra1.mp4",
+    "/home/angel/kanvis/hand_object_detection/videos/compra2.mp4",
+    "/home/angel/kanvis/hand_object_detection/videos/devolver1.mp4",
+    "/home/angel/kanvis/hand_object_detection/videos/devolver2.mp4",
+    "/home/angel/kanvis/hand_object_detection/videos/robo_mochila.mp4",
+    "/home/angel/kanvis/hand_object_detection/videos/robo_normal.mp4"
   ],
   "approaches": [
     {"id": "clip", "script": "test_new_handobject_clip.py"},
