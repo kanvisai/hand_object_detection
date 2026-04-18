@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pre-vuelo: ejecuta check_models, comprueba librerías, GPU, actualiza device en experiments_catalog.json,
+Pre-vuelo: ejecuta check_models, comprueba librerías, GPU, actualiza device y rutas de modelos en experiments_catalog.json,
 y estima tiempos de campaña (heurísticas documentadas).
 
-Uso: python preflight_check.py [--no-update-catalog]
+Uso: python preflight_check.py [--no-update-catalog] [--no-update-model-paths]
 """
 from __future__ import annotations
 
@@ -213,6 +213,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Pre-flight antes de experimentos.")
     ap.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     ap.add_argument("--no-update-catalog", action="store_true", help="No escribir device en experiments_catalog.json.")
+    ap.add_argument(
+        "--no-update-model-paths",
+        action="store_true",
+        help="No escribir rutas HF/YOLO resueltas en experiments_catalog (check_models).",
+    )
     ap.add_argument("--skip-yolo-engine", action="store_true", help="Reenviado a check_models.")
     ap.add_argument("--download-only-check", action="store_true", help="Solo descarga HF en check_models.")
     args = ap.parse_args()
@@ -220,11 +225,26 @@ def main() -> None:
     print("=== 1. check_models ===")
     import check_models as cm
 
+    catalog_path = args.catalog.expanduser().resolve()
     rep = cm.run_checks(
         skip_yolo_engine=args.skip_yolo_engine,
         download_only=args.download_only_check,
+        update_experiments_catalog=None
+        if args.no_update_model_paths
+        else catalog_path,
     )
-    print(json.dumps({"summary_ok": rep.get("summary_ok"), "yolo_count": len(rep.get("yolo", [])), "hub_count": len(rep.get("hub_models", []))}, indent=2))
+    print(
+        json.dumps(
+            {
+                "summary_ok": rep.get("summary_ok"),
+                "yolo_count": len(rep.get("yolo", [])),
+                "hub_count": len(rep.get("hub_models", [])),
+                "experiments_catalog_update": rep.get("experiments_catalog_update"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     if not rep.get("summary_ok"):
         print("[preflight] check_models fallo. Detalle:")
         for y in rep.get("yolo", []):
@@ -249,7 +269,6 @@ def main() -> None:
     if gi.get("available") and gi.get("details"):
         device_str = f"cuda:{gi['details'][0]['index']}"
 
-    catalog_path = args.catalog.expanduser().resolve()
     if not args.no_update_catalog:
         update_catalog_device(catalog_path, device_str, dry=False)
     else:
