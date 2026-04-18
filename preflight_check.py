@@ -3,7 +3,12 @@
 Pre-vuelo: ejecuta check_models, comprueba librerías, GPU, actualiza device y rutas de modelos en experiments_catalog.json,
 y estima tiempos de campaña (heurísticas documentadas).
 
-Uso: python preflight_check.py [--no-update-catalog] [--no-update-model-paths] [--output-root PATH]
+Uso: python preflight_check.py [opciones]
+
+  --campaign NOMBRE_O_RUTA   (opcional) carpeta de una campaña ya ejecutada, bajo --output-root
+                             o ruta absoluta. Si existe phase1_summary.json, ajusta la heurística
+                             de tiempos con las medianas reales (derived_ranking_score por approach).
+                             Muestra también cintas informativas si hay phase2/3 JSON.
 
 Colores: desactiva con variable de entorno NO_COLOR. En salida no TTY se omite el color.
 """
@@ -13,6 +18,7 @@ import argparse
 import importlib.util
 import json
 import os
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -293,9 +299,68 @@ def _effective_video_rows_for_estimate(
     return ok_rows
 
 
+def _resolve_campaign_dir(output_root: Path, campaign: Path) -> Path:
+    """Ruta a carpeta de campaña: absoluta o relativa a output_root (como orquestador)."""
+    c = campaign.expanduser()
+    if c.is_absolute():
+        return c.resolve()
+    return (output_root / c).resolve()
+
+
+def calibrate_approach_scores_from_phase1(campaign_dir: Path) -> dict[str, float]:
+    """
+    Medianas de derived_ranking_score (= wall de pipeline / s de vídeo) por approach_id
+    a partir de runs exitosos en phase1_summary.json. Vacío si no hay fichero o datos.
+    """
+    p1 = campaign_dir / "phase1_summary.json"
+    if not p1.is_file():
+        return {}
+    try:
+        with open(p1, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    runs = data.get("runs") or []
+    by_aid: dict[str, list[float]] = {}
+    for r in runs:
+        if not r.get("success"):
+            continue
+        sc = r.get("derived_ranking_score")
+        if sc is None:
+            continue
+        aid = str(r.get("approach_id") or "").strip()
+        if not aid:
+            continue
+        by_aid.setdefault(aid, []).append(float(sc))
+    out: dict[str, float] = {}
+    for aid, scores in by_aid.items():
+        if scores:
+            out[aid] = float(statistics.median(scores))
+    return out
+
+
+def _rel_for_approach(
+    aid: str, cal: dict[str, float] | None
+) -> tuple[float, float, bool]:
+    """
+    (cpu_r, gpu_r) por segundo de vídeo fuente, y si se usó mediana phase1.
+    Con datos de cal, gpu_r = observado; cpu_r = observado * (tabla_cpu/tabla_gpu) de ese approach.
+    `cal` vacío {}: todo por tabla. `None`: sin intentar leer campaña.
+    """
+    base = _REL_CPU_PER_VIDEO_SEC.get(aid, (5.0, 1.0))
+    t_cpu, t_gpu = float(base[0]), float(base[1])
+    if t_gpu <= 0:
+        t_gpu = 1.0
+    if cal is not None and aid in cal and cal[aid] is not None:
+        obs = float(cal[aid])
+        return (obs * (t_cpu / t_gpu), obs, True)
+    return (t_cpu, t_gpu, False)
+
+
 def estimate_campaign_time(
     catalog: dict[str, Any],
     video_rows: list[dict[str, Any]],
+    cal: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     approaches, profiles = _effective_approach_profile_ids(catalog)
     valid_videos = _effective_video_rows_for_estimate(catalog, video_rows)
@@ -312,7 +377,7 @@ def estimate_campaign_time(
         if d <= 0:
             continue
         for aid in approaches:
-            cpu_r, gpu_r = _REL_CPU_PER_VIDEO_SEC.get(aid, (5.0, 1.0))
+            cpu_r, gpu_r, _used_cal = _rel_for_approach(aid, cal)
             for pid in profiles:
                 stride = max(1, int(_PROFILE_STRIDE.get(pid, 2)))
                 adj = 2.0 / float(stride)
@@ -326,16 +391,37 @@ def estimate_campaign_time(
             " Fase 1 screening: solo UN video del catalogo (screening_video_index); "
             "la suma de duraciones ya no incluye el resto de clips."
         )
+    cal_applied = [a for a in approaches if cal is not None and a in cal]
+    cal_missing = [a for a in approaches if cal is None or a not in (cal or {})]
+    if cal is not None:
+        if cal_applied:
+            cal_note = (
+                f" Calibrado con phase1: {', '.join(sorted(cal_applied))} = mediana derived_ranking_score; "
+                f"resto (tabla fija): {', '.join(sorted(cal_missing))}."
+                if cal_missing
+                else " Calibrado: todos los approaches de esta matriz con mediana observada en phase1."
+            )
+        else:
+            cal_note = (
+                " phase1_summary leído pero sin runs calibrables; heuristica fija (tabla _REL_*)."
+            )
+    else:
+        cal_note = (
+            " Heuristica fija. Pasa --campaign a una carpeta con phase1_summary.json "
+            "para ajustar por mediana (misma máquina / entorno de la carrera de referencia)."
+        )
     return {
         "experiment_count": total_exp,
         "videos_ok_count": len(videos_ok_all),
         "videos_used_in_estimate_count": len(valid_videos),
         "total_video_duration_sec": round(sum_dur, 2),
+        "calibration_approach_ids": cal_applied,
+        "unresolved_approach_ids": cal_missing,
         "heuristic_note": (
             "Estimacion por tablas _REL_CPU_PER_VIDEO_SEC y stride por perfil; "
             "la escena real (ROI, manos, per_hand_fast) cambia llamadas VLM. "
-            "Calibra con tus phase1_summary.json cuando tengas datos."
-            " CPU vs GPU: si ejecutas en cuda, la fila GPU es la relevante (CPU suele ser ordenes de magnitud pesimista)."
+            + cal_note
+            + " CPU vs GPU: en cuda, guia la fila GPU; la fila CPU reescala el ratio desde la misma mediana."
             + note_extra
         ),
         "estimated_total_wall_sec_cpu": round(cpu_sec, 1),
@@ -345,6 +431,47 @@ def estimate_campaign_time(
         "estimated_duration_hms_cpu": format_duration_hms(cpu_sec),
         "estimated_duration_hms_gpu": format_duration_hms(gpu_sec),
     }
+
+
+def print_phase23_reference(campaign_dir: Path) -> None:
+    """Líneas informativas a partir de phase2_parallel_summary.json y phase3_parallel_sweep_summary.json."""
+    p2 = campaign_dir / "phase2_parallel_summary.json"
+    p3 = campaign_dir / "phase3_parallel_sweep_summary.json"
+    if not p2.is_file() and not p3.is_file():
+        return
+    _title("Referencia fases 2 y 3 (misma campaña)")
+    if p2.is_file():
+        try:
+            d2 = json.loads(p2.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            d2 = {}
+        mlist = d2.get("models") or []
+        for m in mlist[:8]:
+            aid = m.get("approach_id", "?")
+            nvid = m.get("videos_parallel", "?")
+            bw = m.get("batch_wall_clock_sec")
+            med = m.get("median_derived_ranking_score")
+            print(
+                f"    fase2  ·  {aid}  ·  {nvid} víd. en paral.  ·  lote pared {bw} s  ·  mediana score {med}"
+            )
+        if len(mlist) > 8:
+            print(f"    …  +{len(mlist) - 8} entradas en models[]")
+    if p3.is_file():
+        try:
+            d3 = json.loads(p3.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            d3 = {}
+        nok = d3.get("last_fully_successful_n_parallel")
+        why = d3.get("sweep_ended_because")
+        mode = d3.get("sweep_mode")
+        st = d3.get("n_steps_tried")
+        if isinstance(st, list) and len(st) > 8:
+            st_s = f"{st[:8]}… (total {len(st)})"
+        else:
+            st_s = st
+        print(
+            f"    fase3  ·  último N OK: {nok}  ·  fin: {why}  ·  modo: {mode}  ·  N probados: {st_s}"
+        )
 
 
 def campaign_metadata(
@@ -386,9 +513,41 @@ def main() -> None:
         default=DEFAULT_OUTPUT_ROOT,
         help="Raíz de salida (igual que test_experiments_approaches --output-root); solo informativo.",
     )
+    ap.add_argument(
+        "--campaign",
+        type=str,
+        default="",
+        metavar="CARPETA",
+        help=(
+            "Carpeta bajo --output-root (mismo --campaign del orquestador) o ruta absoluta. "
+            "Si existe phase1_summary.json, la estimación de tiempos usa la mediana de derived_ranking_score "
+            "por approach (fase1). Muestra referencia de fase2/3 si hay JSON de resumen."
+        ),
+    )
     args = ap.parse_args()
+    out_root = args.output_root.expanduser().resolve()
+    campaign_arg = (args.campaign or "").strip()
+    campaign_resolved: Path | None = None
+    if campaign_arg:
+        campaign_resolved = _resolve_campaign_dir(out_root, Path(campaign_arg))
+    cal_for_est: dict[str, float] | None = None
+    if campaign_resolved is not None and campaign_resolved.is_dir():
+        # {} = phase1 leído pero sin runs útiles; None = no carpeta o sin --campaign
+        cal_for_est = calibrate_approach_scores_from_phase1(campaign_resolved)
 
     _title("Preflight · modelos, entorno y campaña estimada")
+    if campaign_arg and campaign_resolved is not None:
+        if campaign_resolved.is_dir():
+            print(
+                f"  Campaña (calibración / ref.): {campaign_resolved}  "
+                f"(resuelta contra --output-root si el argumento era relativo)"
+            )
+        else:
+            print(
+                _yellow(
+                    f"  --campaign: no existe {campaign_resolved} → sin calibración ni ref. fase2/3"
+                )
+            )
     print(f"  Catálogo: {args.catalog}")
 
     _section("1", "Modelos (check_models)")
@@ -482,12 +641,10 @@ def main() -> None:
             if not v.get("ok"):
                 short = str(v.get("path", ""))[-52:]
                 print(f"       ✗  …{short}  ({v.get('error', '')})")
-        est = estimate_campaign_time(cat_data, vrows)
+        est = estimate_campaign_time(cat_data, vrows, cal_for_est)
         meta = campaign_metadata(cat_data, vrows)
     else:
         print(f"    {_ok_symbol(False)}  No se encontró {catalog_path}")
-
-    out_root = args.output_root.expanduser().resolve()
 
     _title("Campaña · números y salida")
     issues: list[str] = []
@@ -559,8 +716,23 @@ def main() -> None:
             print(_dim(wrap[:chunk]))
             for i in range(chunk, len(wrap), chunk):
                 print(f"           {_dim(wrap[i : i + chunk])}")
+        if cal_for_est is not None and not cal_for_est:
+            print()
+            print(
+                f"    {_dim('phase1_summary.json leído sin medianas (ningún run exitoso con score).')}"
+            )
+        elif cal_for_est:
+            print()
+            print(f"    {_dim('Medianas phase1 (derived_ranking_score) aplicadas al coste por approach:')}")
+            for aid, v in sorted(cal_for_est.items(), key=lambda x: x[0])[:24]:
+                print(f"      {aid}  →  {v:.3f}  s pipeline / s vídeo")
+            if len(cal_for_est) > 24:
+                print(f"      …  +{len(cal_for_est) - 24} approaches")
     else:
         print(_yellow("    Sin estimación: falta catálogo o vídeos válidos."))
+
+    if campaign_resolved is not None and campaign_resolved.is_dir():
+        print_phase23_reference(campaign_resolved)
 
     print()
     _rule("═")

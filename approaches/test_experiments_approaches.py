@@ -7,13 +7,20 @@ output_results/<campaña>/logs/orchestrator_<UTC>.log (salida del orquestador + 
 
 Tras la fase 1, opcionalmente lanza fase 2: por defecto los 2 mejores modelos; con --phase2-all-ranked todos los
 del ranking (mejor perfil c/u), N videos en paralelo por modelo (cada modelo en su tanda).
+phase1_summary/phase2_parallel incluyen `resource_summary` (CPU, RAM, VRAM) agregado desde metrics.json + experiment_summary.
 
-Modo sin ventana: cada run pasa --save (video en disco); no se usa cv2.imshow. Entorno headless
+Fase 3 opcional (--phase3-parallel-sweep o --only-phase3): el mismo approach y un vídeo, N subprocesos
+en paralelo. Por defecto barrido adaptativo (dobla N y refina por búsqueda binaria) hasta fallo, OOM o
+tope --phase3-max-parallel. Con --phase3-sweep-mode fixed se usa --phase3-steps. Ver phase3_parallel_sweep_summary.json.
+
+Modo sin ventana: fase1/2/3 no pasan --save (sin vídeo de salida; solo métricas; alineado a escenario
+producción sin grabar). No se usa cv2.imshow. Entorno headless
 (QT_QPA_PLATFORM=offscreen, MPLBACKEND=Agg) para evitar GUI accidental en segundo plano.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import re
@@ -27,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-from subprocess import PIPE, Popen
+from subprocess import PIPE, Popen, run as subprocess_run
 from typing import Any, TextIO
 
 # paquetes opcionales
@@ -158,6 +165,8 @@ class RunSpec:
     video_path: Path
     merged_args: dict[str, Any]
     vlm_model_override: str | None = None
+    # Por defecto no se escribe mp4 (--save vacío); poner True solo si hace falta depurar salida en disco
+    write_output_video: bool = False
 
 
 def load_catalog(path: Path) -> dict[str, Any]:
@@ -305,7 +314,10 @@ def run_single_experiment(
 
     merged = dict(spec.merged_args)
     merged["video"] = str(spec.video_path.resolve())
-    merged["save"] = str(video_path.resolve())
+    if spec.write_output_video:
+        merged["save"] = str(video_path.resolve())
+    else:
+        merged["save"] = ""
     merged["output"] = str(metrics_path.resolve())
 
     argv = [sys.executable, str(APPROACHES_DIR / spec.script)] + merged_cli_to_argv(merged)
@@ -482,6 +494,125 @@ def pipeline_report_indicates_success(report: dict[str, Any]) -> bool:
     )
 
 
+def _bytes_to_mib(b: int | None) -> float | None:
+    if b is None or b <= 0:
+        return None
+    return round(float(b) / (1024.0**2), 4)
+
+
+def extract_resource_row_from_run_dir(run_dir: str | Path) -> dict[str, Any]:
+    """
+    Lee metrics.json y experiment_summary.json de un run y devuelve subconjunto comparable.
+    nvidia_smi en metrics refleja snapshots del GPU (puede incluir otros procesos en el instante del muestreo).
+    """
+    rd = Path(run_dir)
+    out: dict[str, Any] = {
+        "run_dir": str(rd),
+        "host_peak_rss_mib": None,
+        "subprocess_wall_sec": None,
+        "host_cpu_percent_mean": None,
+        "host_cpu_percent_max": None,
+        "torch_cuda_peak_allocated_mib": None,
+        "nvidia_gpu_utilization_mean_percent": None,
+        "nvidia_gpu_memory_used_mean_mib": None,
+        "nvidia_gpu_memory_total_mib_sample": None,
+        "est_max_parallel_streams_by_memory_naive": None,
+        "vlm_device": None,
+    }
+    sp = rd / "experiment_summary.json"
+    if sp.is_file():
+        try:
+            with open(sp, encoding="utf-8") as f:
+                ex = json.load(f)
+            env = ex.get("envelope") or {}
+            h = (env.get("host_process_metrics") or {}) if isinstance(env.get("host_process_metrics"), dict) else {}
+            pr = h.get("host_peak_rss_bytes")
+            if pr is not None:
+                out["host_peak_rss_mib"] = _bytes_to_mib(int(pr))
+            if h.get("subprocess_wall_sec") is not None:
+                out["subprocess_wall_sec"] = float(h["subprocess_wall_sec"])
+            if h.get("host_cpu_percent_mean") is not None:
+                out["host_cpu_percent_mean"] = float(h["host_cpu_percent_mean"])
+            if h.get("host_cpu_percent_max") is not None:
+                out["host_cpu_percent_max"] = float(h["host_cpu_percent_max"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    mp = rd / "metrics.json"
+    if mp.is_file():
+        try:
+            with open(mp, encoding="utf-8") as f:
+                m = json.load(f)
+            if m.get("torch_cuda_peak_memory_allocated_mib") is not None:
+                out["torch_cuda_peak_allocated_mib"] = float(m["torch_cuda_peak_memory_allocated_mib"])
+            if m.get("nvidia_gpu_utilization_mean_percent") is not None:
+                out["nvidia_gpu_utilization_mean_percent"] = float(m["nvidia_gpu_utilization_mean_percent"])
+            if m.get("nvidia_gpu_memory_used_mean_mib") is not None:
+                out["nvidia_gpu_memory_used_mean_mib"] = float(m["nvidia_gpu_memory_used_mean_mib"])
+            if m.get("nvidia_gpu_memory_total_mib_sample") is not None:
+                out["nvidia_gpu_memory_total_mib_sample"] = float(m["nvidia_gpu_memory_total_mib_sample"])
+            if m.get("est_max_parallel_streams_by_memory_naive") is not None:
+                out["est_max_parallel_streams_by_memory_naive"] = int(m["est_max_parallel_streams_by_memory_naive"])
+            if m.get("vlm_device") is not None:
+                out["vlm_device"] = str(m["vlm_device"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return out
+
+
+def _num_stats(xs: list[float]) -> dict[str, float | None]:
+    if not xs:
+        return {"min": None, "max": None, "median": None, "mean": None}
+    m = median(xs)
+    return {
+        "min": round(min(xs), 4),
+        "max": round(max(xs), 4),
+        "median": round(m, 4) if m is not None else None,
+        "mean": round(sum(xs) / len(xs), 4),
+    }
+
+
+def aggregate_resource_rows(
+    rows: list[dict[str, Any]],
+    *,
+    include_per_run: bool = True,
+) -> dict[str, Any]:
+    """Agrega medianas/min/max de filas de extract_resource_row_from_run_dir."""
+    if not rows:
+        return {
+            "runs_aggregated": 0,
+            "numeric_summary": {},
+            "per_run": [] if include_per_run else None,
+        }
+    keys_float = [
+        "host_peak_rss_mib",
+        "subprocess_wall_sec",
+        "host_cpu_percent_mean",
+        "host_cpu_percent_max",
+        "torch_cuda_peak_allocated_mib",
+        "nvidia_gpu_utilization_mean_percent",
+        "nvidia_gpu_memory_used_mean_mib",
+    ]
+    per_key: dict[str, dict[str, float | None]] = {}
+    for k in keys_float:
+        vals: list[float] = []
+        for r in rows:
+            v = r.get(k)
+            if v is not None:
+                try:
+                    vals.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        if vals:
+            per_key[k] = _num_stats(vals)  # type: ignore[assignment]
+    out: dict[str, Any] = {
+        "runs_aggregated": len(rows),
+        "numeric_summary": per_key,
+    }
+    if include_per_run:
+        out["per_run"] = rows
+    return out
+
+
 def build_best_profile_comparison(
     run_results: list[dict[str, Any]],
     ranked: list[dict[str, Any]],
@@ -616,6 +747,16 @@ def summarize_phase1_campaign(
 
     comparison_best_profile = build_best_profile_comparison(run_results, ranked)
 
+    res_rows: list[dict[str, Any]] = []
+    for r in succeeded:
+        rd = r.get("run_dir")
+        if rd and Path(str(rd)).exists():
+            res_rows.append(extract_resource_row_from_run_dir(str(rd)))
+    if res_rows and len(res_rows) > 20:
+        resource_summary = aggregate_resource_rows(res_rows, include_per_run=False)
+    else:
+        resource_summary = aggregate_resource_rows(res_rows, include_per_run=True)
+
     return {
         "phase1_orchestrator_wall_sec": round(phase1_wall_sec, 3),
         "runs_planned": n,
@@ -628,6 +769,15 @@ def summarize_phase1_campaign(
         "derived_ranking_score_global_p90": percentile(scores, 90),
         "by_approach": per_app,
         "comparison_best_profile": comparison_best_profile,
+        "resource_summary": resource_summary,
+        "resource_fields_glossary": {
+            "host_peak_rss_mib": "Pico RSS del proceso hijo (psutil) por run, en MiB; mediana/min/max en runs exitosos.",
+            "subprocess_wall_sec": "Pared del subproceso (orquestador) incluye carga de modelos, etc.",
+            "torch_cuda_peak_allocated_mib": "Pico VRAM reservada por asignación PyTorch del proceso; por run.",
+            "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi en el tramo con vídeo (puede mezclar con otros procesos en GPU).",
+            "nvidia_gpu_memory_used_mean_mib": "Media memoria usada de la GPU (nvidia-smi, todo el dispositivo en el instante).",
+            "host_cpu_percent_mean": "Media CPU% del subproceso mientras corre (hasta >100% con varios cores).",
+        },
         "metrics_glossary": {
             "video_duration_sec": "Duración del clip en segundos (metadatos del vídeo).",
             "video_duration_vlm_application": (
@@ -768,6 +918,27 @@ def phase2_parallel_batch(
         successes = [x for x in parallel_out if x.get("success")]
         scores = [float(x["derived_ranking_score"]) for x in successes if x.get("derived_ranking_score") is not None]
 
+        res_rows_m: list[dict[str, Any]] = []
+        per_video_res: list[dict[str, Any]] = []
+        for r in parallel_out:
+            rd = r.get("run_dir")
+            if not rd:
+                continue
+            row = extract_resource_row_from_run_dir(str(rd))
+            row["video_stem"] = Path(str(r.get("video_path", ""))).stem
+            res_rows_m.append(row)
+            per_video_res.append(
+                {
+                    "video_stem": row["video_stem"],
+                    "host_peak_rss_mib": row.get("host_peak_rss_mib"),
+                    "torch_cuda_peak_allocated_mib": row.get("torch_cuda_peak_allocated_mib"),
+                    "nvidia_gpu_utilization_mean_percent": row.get("nvidia_gpu_utilization_mean_percent"),
+                    "nvidia_gpu_memory_used_mean_mib": row.get("nvidia_gpu_memory_used_mean_mib"),
+                }
+            )
+        resource_by_model = aggregate_resource_rows(res_rows_m, include_per_run=False)
+        resource_by_model["per_video"] = per_video_res
+
         results_by_model.append(
             {
                 "rank": rank,
@@ -778,6 +949,7 @@ def phase2_parallel_batch(
                 "videos_parallel": len(videos),
                 "runs": parallel_out,
                 "median_derived_ranking_score": median(scores),
+                "resource_summary": resource_by_model,
                 "note": "batch_wall_clock_sec es hasta que terminan todas las corridas en paralelo (duracion del lote).",
             }
         )
@@ -788,8 +960,493 @@ def phase2_parallel_batch(
         "description": (
             "Cada approach listado procesa todos los videos en paralelo; los modelos se ejecutan uno tras otro."
         ),
+        "resource_fields_glossary": {
+            "host_peak_rss_mib": "Pico RSS del subproceso (psutil) en MiB, por run (cada video).",
+            "subprocess_wall_sec": "Pared del subproceso; en agregados, min/median/max entre videos del lote.",
+            "torch_cuda_peak_allocated_mib": "Pico asignado PyTorch en GPU para ese run (metrics.json).",
+            "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi en el tramo con vídeo (puede mezclar con otros clientes de la GPU).",
+            "nvidia_gpu_memory_used_mean_mib": "Memoria de GPU usada (nvidia-smi, dispositivo entero en el muestreo).",
+            "est_max_parallel_streams_by_memory_naive": "Heurística VRAM_total / pico PyTorch del run; no es límite operativo real.",
+        },
         "models": results_by_model,
     }
+
+
+def _nvidia_gpu_mem_used_mib() -> int | None:
+    try:
+        p = subprocess_run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if p.returncode == 0 and p.stdout.strip():
+            return int(float(p.stdout.strip().splitlines()[0].strip()))
+    except (OSError, ValueError, FileNotFoundError):
+        pass
+    return None
+
+
+def _mem_monitor_loop(stop: threading.Event, out: dict[str, Any]) -> None:
+    while not stop.wait(0.2):
+        if psutil is not None:
+            try:
+                u = int(psutil.virtual_memory().used)
+                out["host_used_max"] = max(int(out.get("host_used_max", 0)), u)
+            except (OSError, RuntimeError, AttributeError):
+                break
+        nvm = _nvidia_gpu_mem_used_mib()
+        if nvm is not None:
+            if out.get("nv_mem_max_mib") is None:
+                out["nv_mem_max_mib"] = nvm
+            else:
+                out["nv_mem_max_mib"] = max(int(out["nv_mem_max_mib"]), nvm)
+
+
+def _stderr_all_runs(outs: list[dict[str, Any]]) -> str:
+    s = []
+    for r in outs:
+        p = Path(str(r.get("run_dir", ""))) / "experiment_summary.json"
+        if p.is_file():
+            try:
+                with open(p, encoding="utf-8") as f:
+                    ed = json.load(f)
+                t = (ed.get("envelope", {}).get("stderr_tail", "")) or ""
+            except (OSError, json.JSONDecodeError):
+                t = ""
+            s.append(t)
+    return "\n".join(s).lower()
+
+
+def _phase3_post_batch_hygiene(pause_sec: float) -> None:
+    """Entre dosis: GC, vaciar caché CUDA en el orquestador (hijos ya terminaron) y pausa."""
+    gc.collect()
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if pause_sec > 0:
+        time.sleep(pause_sec)
+
+
+def _parse_phase3_steps_str(s: str) -> list[int]:
+    out: list[int] = []
+    for part in (s or "").split(","):
+        t = part.strip()
+        if t.isdigit() and int(t) > 0:
+            out.append(int(t))
+    return out
+
+
+def _phase3_execute_n_batch(
+    N: int,
+    step_dir: Path,
+    approach_id: str,
+    profile_id: str,
+    ap_obj: dict[str, Any],
+    script: str,
+    merged_base: dict[str, Any],
+    video_path: Path,
+    monitor_psutil: bool,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+) -> tuple[dict[str, Any], bool, bool]:
+    """Un lote con N subprocesos. Devuelve (step_entry, all_success, oom_suspect)."""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    peaks: dict[str, Any] = {"host_used_max": 0, "nv_mem_max_mib": None}
+    stop_m = threading.Event()
+    t_mon = threading.Thread(target=_mem_monitor_loop, args=(stop_m, peaks), daemon=True)
+    t_mon.start()
+    t0 = time.perf_counter()
+
+    def _one(i: int) -> dict[str, Any]:
+        rd = step_dir / f"run_{i:02d}"
+        sp = RunSpec(
+                approach_id=approach_id,
+                script=script,
+                profile_id=profile_id,
+                video_path=video_path,
+                merged_args=dict(merged_base),
+                vlm_model_override=ap_obj.get("vlm_model"),
+            )
+        return run_single_experiment(
+            sp,
+            rd,
+            monitor_psutil,
+            stream_log=stream_log,
+            run_label=f"[fase3 N={N} run={i}]",
+        )
+
+    with ThreadPoolExecutor(max_workers=N) as ex:
+        outs: list[dict[str, Any]] = list(ex.map(_one, list(range(N))))
+    stop_m.set()
+    t_mon.join(timeout=2.0)
+    batch_wall = time.perf_counter() - t0
+    all_ok = all(x.get("success") for x in outs)
+    combined_err = _stderr_all_runs(outs)
+    oom = "out of memory" in combined_err or "cuda out of memory" in combined_err
+
+    walls: list[float] = []
+    for r in outs:
+        w = r.get("wall_clock_processing_sec")
+        if w is not None:
+            walls.append(float(w))
+    sw: list[float] = []
+    rss_sum_vals: list[float] = []
+    for r in outs:
+        rd0 = str(r.get("run_dir", ""))
+        if rd0:
+            row0 = extract_resource_row_from_run_dir(rd0)
+            s0 = row0.get("subprocess_wall_sec")
+            if s0 is not None:
+                sw.append(float(s0))
+            hpr = row0.get("host_peak_rss_mib")
+            if hpr is not None:
+                rss_sum_vals.append(float(hpr))
+
+    step_entry: dict[str, Any] = {
+        "n_parallel": N,
+        "all_success": all_ok,
+        "any_oom_suspect": oom,
+        "batch_wall_clock_sec": round(batch_wall, 6),
+        "mean_pipeline_wall_sec": (round(sum(walls) / len(walls), 6) if walls else None),
+        "max_pipeline_wall_sec": (round(max(walls), 6) if walls else None),
+        "min_pipeline_wall_sec": (round(min(walls), 6) if walls else None),
+        "mean_subprocess_wall_sec": (round(sum(sw) / len(sw), 6) if sw else None),
+        "peak_host_memory_used_bytes_during_batch": int(peaks["host_used_max"])
+        if int(peaks.get("host_used_max", 0) or 0) > 0
+        else None,
+        "peak_nvidia_gpu_mem_used_mib_smi": int(peaks["nv_mem_max_mib"])
+        if peaks.get("nv_mem_max_mib") is not None
+        else None,
+        "sum_host_peak_rss_mib_from_runs": (round(sum(rss_sum_vals), 2) if rss_sum_vals else None),
+        "runs": [
+            {
+                "run_dir": r.get("run_dir"),
+                "success": r.get("success"),
+                "wall_clock_processing_sec": r.get("wall_clock_processing_sec"),
+            }
+            for r in outs
+        ],
+    }
+    return step_entry, all_ok, oom
+
+
+def run_phase3_parallel_sweep(
+    catalog: dict[str, Any],
+    campaign_dir: Path,
+    approach_id: str,
+    profile_id: str,
+    video_path: Path,
+    n_steps: list[int] | None,
+    monitor_psutil: bool,
+    *,
+    sweep_mode: str = "adaptive",
+    start_n: int = 1,
+    max_parallel: int = 64,
+    pause_sec: float = 2.0,
+    min_free_ram_mib: int = 512,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+) -> dict[str, Any]:
+    """
+    Fase 3: N subprocesos = N flujos. Modo `fixed`: N recorre n_steps. Modo `adaptive`: dobla N
+    (desde start_n) hasta fallo, tope o cap; luego búsqueda binaria en (ultimo_ok, primer_fallo) para
+    afinar el máximo N. Entre lotes: GC, empty_cache CUDA y pausa.
+    """
+    ap_obj = next((x for x in catalog.get("approaches", []) if x.get("id") == approach_id), None)
+    if not ap_obj:
+        raise RuntimeError(f"approach {approach_id!r} no en catalogo")
+    script = str(ap_obj["script"])
+    merged_base = build_merged_for_phase2(catalog, approach_id, profile_id)
+    if ap_obj.get("vlm_model"):
+        merged_base["vlm_model"] = ap_obj["vlm_model"]
+
+    sweep_dir = campaign_dir / "phase3_parallel_sweep"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    if sweep_mode not in ("adaptive", "fixed"):
+        raise RuntimeError("sweep_mode debe ser 'adaptive' o 'fixed'")
+    if sweep_mode == "fixed":
+        n_sorted = sorted({int(n) for n in (n_steps or []) if n > 0})
+        if not n_sorted:
+            raise RuntimeError("modo fixed: n_steps vacia o no valida (enteros > 0).")
+    else:
+        n_sorted = []
+    st0 = max(1, int(start_n))
+    cap = max(1, int(max_parallel))
+
+    step_results: list[dict[str, Any]] = []
+    n_tried_order: list[int] = []
+    last_fully_ok_n: int = 0
+    stop_sweep: str | None = None
+    adaptive_meta: dict[str, Any] = {
+        "start_n": st0,
+        "max_parallel_cap": cap,
+        "exponential_last_ok": None,
+        "exponential_first_fail": None,
+        "binary_refinement_used": False,
+    }
+
+    def _low_ram_block(N: int) -> bool:
+        if psutil is None or int(min_free_ram_mib) <= 0:
+            return False
+        av = int(psutil.virtual_memory().available)
+        if av < int(min_free_ram_mib) * 1024 * 1024:
+            step_results.append(
+                {
+                    "n_parallel": N,
+                    "skipped": True,
+                    "skip_reason": (
+                        f"host_available_mib aprox: {av / 1024 / 1024:.0f} < {min_free_ram_mib} "
+                        "(cota min_free_ram_mib)"
+                    ),
+                }
+            )
+            return True
+        return False
+
+    def _append_step(
+        N: int,
+        step_entry: dict[str, Any],
+        all_ok: bool,
+        oom: bool,
+        *,
+        on_fail: str = "incomplete_runs",
+        set_stop: bool = True,
+    ) -> None:
+        nonlocal last_fully_ok_n, stop_sweep
+        step_results.append(step_entry)
+        n_tried_order.append(N)
+        if all_ok and not oom:
+            last_fully_ok_n = N
+        if set_stop and (oom or not all_ok):
+            stop_sweep = "cuda_or_host_oom" if oom else on_fail
+        _phase3_post_batch_hygiene(pause_sec)
+
+    if sweep_mode == "fixed":
+        for N in n_sorted:
+            if stop_sweep is not None:
+                break
+            if _low_ram_block(N):
+                stop_sweep = "low_host_ram"
+                break
+            sdir = sweep_dir / f"n_parallel_{N:03d}"
+            st, all_ok, oom = _phase3_execute_n_batch(
+                N,
+                sdir,
+                approach_id,
+                profile_id,
+                ap_obj,
+                script,
+                merged_base,
+                video_path,
+                monitor_psutil,
+                stream_log,
+            )
+            _append_step(N, st, all_ok, oom, set_stop=True, on_fail="incomplete_runs")
+            if oom or not all_ok:
+                break
+    else:
+        # Fase A: exponencial (start, 2*…, cap) hasta un fallo; Fase B: búsqueda en (últimoOK, fail)
+        tried: set[int] = set()
+        first_fail_n: int | None = None
+        cur = min(st0, cap)
+        if cur < 1:
+            cur = 1
+
+        while first_fail_n is None and stop_sweep is None and cur <= cap:
+            N = cur
+            if N in tried:
+                break
+            if _low_ram_block(N):
+                stop_sweep = "low_host_ram"
+                first_fail_n = N
+                break
+            sdir = sweep_dir / f"n_parallel_{N:03d}"
+            st, all_ok, oom = _phase3_execute_n_batch(
+                N,
+                sdir,
+                approach_id,
+                profile_id,
+                ap_obj,
+                script,
+                merged_base,
+                video_path,
+                monitor_psutil,
+                stream_log,
+            )
+            tried.add(N)
+            if oom or not all_ok:
+                first_fail_n = N
+                _append_step(N, st, all_ok, oom, set_stop=False, on_fail="incomplete_runs")
+                break
+            _append_step(N, st, all_ok, oom, set_stop=False, on_fail="incomplete_runs")
+            if N >= cap:
+                stop_sweep = "hit_max_parallel_cap"
+                break
+            nxt = min(N * 2, cap) if N >= 1 else N + 1
+            if nxt <= N:
+                break
+            cur = nxt
+
+        lo_bracket = int(last_fully_ok_n)
+        adaptive_meta["exponential_last_ok"] = int(last_fully_ok_n)
+        adaptive_meta["exponential_first_fail"] = int(first_fail_n) if first_fail_n is not None else None
+
+        cands_bin: list[int] = []
+        if first_fail_n is not None and int(first_fail_n) > lo_bracket + 1 and stop_sweep is None:
+            cands_bin = [c for c in range(lo_bracket + 1, int(first_fail_n)) if c not in tried]
+        if cands_bin:
+            adaptive_meta["binary_refinement_used"] = True
+            l_i, r_i = 0, len(cands_bin) - 1
+            best_ok = lo_bracket
+            while l_i <= r_i and stop_sweep is None:
+                mid_i = (l_i + r_i) // 2
+                m = cands_bin[mid_i]
+                if _low_ram_block(m):
+                    stop_sweep = "low_host_ram"
+                    break
+                sdir2 = sweep_dir / f"n_parallel_{m:03d}"
+                st2, oka, oom2 = _phase3_execute_n_batch(
+                    m,
+                    sdir2,
+                    approach_id,
+                    profile_id,
+                    ap_obj,
+                    script,
+                    merged_base,
+                    video_path,
+                    monitor_psutil,
+                    stream_log,
+                )
+                tried.add(m)
+                if oom2 or not oka:
+                    r_i = mid_i - 1
+                else:
+                    best_ok = m
+                    l_i = mid_i + 1
+                _append_step(m, st2, oka, oom2, set_stop=False, on_fail="incomplete_runs")
+            if stop_sweep is None:
+                last_fully_ok_n = best_ok
+
+        if stop_sweep is None and first_fail_n is not None:
+            for se in reversed(step_results):
+                if se.get("n_parallel") == first_fail_n and not se.get("skipped"):
+                    if se.get("any_oom_suspect"):
+                        stop_sweep = "cuda_or_host_oom"
+                    else:
+                        stop_sweep = "incomplete_runs"
+                    break
+
+    if stop_sweep is None and sweep_mode == "adaptive" and not n_tried_order:
+        stop_sweep = "no_trials"
+
+    return {
+        "generated_utc": _utc_iso(),
+        "phase": 3,
+        "file_role": (
+            "Resumen global fase3 (único JSON a pasar al intérprete). "
+            "Mira: sweep_ended_because, last_fully_successful_n_parallel, steps[] (N, tiempos, picos), "
+            "n_steps_tried, adaptive_search. Cada sub-run: metrics.json + experiment_summary.json "
+            "bajo phase3_parallel_sweep/n_parallel_XXX/run_YY/ (mismo criterio que fase1/2: sin vídeo de salida)."
+        ),
+        "no_output_video": True,
+        "description": (
+            "Barrido: mismo vídeo, mismo approach. N subprocesos = N 'flujos' aislados. "
+            "Modo adaptativo: exponencial + búsqueda binaria. Entre lotes: gc + empty_cache + pausa."
+        ),
+        "sweep_mode": sweep_mode,
+        "approach_id": approach_id,
+        "profile_id": profile_id,
+        "video_path": str(video_path.resolve()),
+        "n_steps_tried": n_tried_order if sweep_mode == "adaptive" else n_sorted,
+        "adaptive_search": adaptive_meta if sweep_mode == "adaptive" else None,
+        "sweep_ended_because": stop_sweep,
+        "last_fully_successful_n_parallel": last_fully_ok_n,
+        "steps": step_results,
+        "recommendation_note": (
+            "ultimo N con all_success (sin OOM) es last_fully_successful_n_parallel. "
+            "Cada 'flujo' = proceso Python separado. Modo adaptativo: el tope se refina con búsqueda binaria "
+            "entre el último lote bueno y el primero que falla (O/Mem). "
+            "Para servicio 1-proceso multi-RTSP, el tope operativo suele ser distinto. "
+            "Los runs de orquestación no usan --save; wall_clock de fase3 es comparable a fase1/2 (sin encod. a disco)."
+        ),
+        "resource_fields_glossary": {
+            "batch_wall_clock_sec": "Hasta el último subproceso (max straggler).",
+            "mean_pipeline_wall_sec": "Media de wall_clock_processing_sec entre los N (mismo mp4 en cada run).",
+            "peak_host_memory_used_bytes_during_batch": "Máximo de psutil virtual_memory().used mientras dura el lote (con más procesos, host total).",
+            "peak_nvidia_gpu_mem_used_mib_smi": "Máximo muestreo nvidia-smi memory.used (GPU 0) durante el lote; todo dispositivo.",
+        },
+    }
+
+
+def _resolve_phase3_video_path(
+    args: Any,
+    catalog: dict[str, Any],
+) -> Path | None:
+    vids2 = [Path(v).expanduser() for v in (catalog.get("videos") or []) if Path(v).expanduser().exists()]
+    if args.phase3_video and Path(str(args.phase3_video)).expanduser().is_file():
+        return Path(str(args.phase3_video)).expanduser().resolve()
+    idx0 = 0
+    if catalog.get("experiment_strategy") == "single_video_screening":
+        idx0 = int(catalog.get("screening_video_index", 0) or 0)
+    if idx0 < len(vids2):
+        return vids2[idx0]
+    return vids2[0] if vids2 else None
+
+
+def _phase3_run_write(
+    catalog: dict[str, Any],
+    campaign_dir: Path,
+    video_path: Path,
+    approach_id: str,
+    profile_id: str,
+    args: Any,
+    monitor_psutil: bool,
+    stream_log: tuple[TextIO, threading.Lock] | None = None,
+) -> dict[str, Any] | None:
+    """Lanza fase3 y escribe `phase3_parallel_sweep_summary.json`. Devuelve el dict o None si no aplica."""
+    if not video_path or not video_path.is_file():
+        return None
+    sm = (getattr(args, "phase3_sweep_mode", "adaptive") or "adaptive").strip().lower()
+    if sm not in ("adaptive", "fixed"):
+        sm = "adaptive"
+    n_steps: list[int] | None
+    if sm == "fixed":
+        n_steps = _parse_phase3_steps_str(str(args.phase3_steps or ""))
+        if not n_steps:
+            print(
+                "[phase3] Modo fixed: no hay N válidos en --phase3-steps. Omito fase 3.",
+                file=sys.stderr,
+            )
+            return None
+    else:
+        n_steps = None
+    t0 = time.perf_counter()
+    p3 = run_phase3_parallel_sweep(
+        catalog,
+        campaign_dir,
+        approach_id,
+        profile_id,
+        video_path,
+        n_steps,
+        monitor_psutil,
+        sweep_mode=sm,
+        start_n=int(getattr(args, "phase3_start_n", 1) or 1),
+        max_parallel=int(getattr(args, "phase3_max_parallel", 64) or 64),
+        pause_sec=float(args.phase3_pause_sec),
+        min_free_ram_mib=int(args.phase3_min_free_ram_mib),
+        stream_log=stream_log,
+    )
+    p3["phase3_orchestrator_wall_sec"] = round(time.perf_counter() - t0, 3)
+    p3p = campaign_dir / "phase3_parallel_sweep_summary.json"
+    with open(p3p, "w", encoding="utf-8") as jf:
+        json.dump(p3, jf, indent=2, ensure_ascii=False)
+    print(f"[ok] Fase 3: {p3p}")
+    return p3
 
 
 def main() -> None:
@@ -844,6 +1501,58 @@ def main() -> None:
         action="store_true",
         help="No crear output_results/.../logs/orchestrator_*.log ni duplicar salida.",
     )
+    ap.add_argument(
+        "--only-phase3",
+        action="store_true",
+        help="Solo fase 3: barrido de N procesos en paralelo; requiere --campaign (carpeta existente).",
+    )
+    ap.add_argument(
+        "--phase3-parallel-sweep",
+        action="store_true",
+        help="Al terminar fase1/2, lanza fase3 (mismo vídeo repetido, rank-1 o --phase3-approach).",
+    )
+    ap.add_argument(
+        "--phase3-sweep-mode",
+        default="adaptive",
+        choices=("adaptive", "fixed"),
+        help="adaptive: dobla N y refina (sin lista manual); fixed: recorre --phase3-steps.",
+    )
+    ap.add_argument(
+        "--phase3-steps",
+        default="3,6,8,10,15,20,30,40,50",
+        help="Solo con --phase3-sweep-mode fixed: N separados por comas, orden creciente recomendado.",
+    )
+    ap.add_argument(
+        "--phase3-start-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Solo adaptativo: primer lote (>=1) antes de ir doblando N.",
+    )
+    ap.add_argument(
+        "--phase3-max-parallel",
+        type=int,
+        default=64,
+        metavar="N",
+        help="Cota superior de N en el barrido adaptativo; evita crecer sin límite teórico.",
+    )
+    ap.add_argument(
+        "--phase3-approach", default="", help="Approach; si vacío se usa el rank 1 (phase1 o phase2)."
+    )
+    ap.add_argument(
+        "--phase3-profile", default="", help="Perfil; si vacío se usa el del rank 1 (phase1 o phase2)."
+    )
+    ap.add_argument(
+        "--phase3-video", type=Path, default=None, help="Ruta a un mp4; sino, vídeo de screening o primero del catálogo."
+    )
+    ap.add_argument("--phase3-pause-sec", type=float, default=2.0, help="Pausa entre dosis (liberar carga suave).")
+    ap.add_argument(
+        "--phase3-min-free-ram-mib",
+        type=int,
+        default=512,
+        metavar="M",
+        help="No lanzar un lote N si available RAM < M MiB (host). 0=desactivar comprobación.",
+    )
     args = ap.parse_args()
 
     catalog_path = args.catalog.expanduser().resolve()
@@ -867,6 +1576,65 @@ def main() -> None:
         catalog["videos"] = kept
         if not kept:
             raise RuntimeError("Tras --skip-missing-videos no queda ningun video en el catalogo.")
+
+    if args.only_phase3:
+        if not args.campaign.strip() and not args.unique_campaign:
+            print("[error] --only-phase3 requiere --campaign (carpeta existente bajo --output-root).", file=sys.stderr)
+            raise SystemExit(1)
+        if not campaign_dir.is_dir():
+            print(f"[error] no existe la campaña: {campaign_dir}", file=sys.stderr)
+            raise SystemExit(1)
+        p2f = campaign_dir / "phase2_parallel_summary.json"
+        p1f = campaign_dir / "phase1_summary.json"
+        aid0 = (args.phase3_approach or "").strip() or None
+        pid0 = (args.phase3_profile or "").strip() or None
+        if aid0 is None or pid0 is None:
+            if p2f.is_file():
+                with open(p2f, encoding="utf-8") as f:
+                    p2d = json.load(f)
+                m0 = (p2d.get("models") or [None])[0] or {}
+                aid0 = aid0 or m0.get("approach_id")
+                pid0 = pid0 or m0.get("profile_id")
+        if aid0 is None or pid0 is None:
+            if p1f.is_file():
+                with open(p1f, encoding="utf-8") as f:
+                    p1d = json.load(f)
+                rrow = (p1d.get("ranking_median_by_approach_best_profile") or [None])[0] or {}
+                aid0 = aid0 or rrow.get("approach_id")
+                pid0 = pid0 or rrow.get("profile_id")
+        if not aid0 or not pid0:
+            print(
+                "[error] No se pudo leer approach/perfil. Usa --phase3-approach y --phase3-profile "
+                "o deja phase1/phase2 summary en la campaña.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        vpick = _resolve_phase3_video_path(args, catalog)
+        if vpick is None or not vpick.is_file():
+            print("[error] Ningun video valido. Usa --phase3-video.", file=sys.stderr)
+            raise SystemExit(1)
+        if (args.phase3_sweep_mode or "adaptive") == "fixed" and not _parse_phase3_steps_str(
+            str(args.phase3_steps or "")
+        ):
+            print(
+                "[error] --phase3-sweep-mode fixed requiere --phase3-steps con al menos un entero > 0.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        p3m = not args.no_psutil and psutil is not None
+        if _phase3_run_write(
+            catalog,
+            campaign_dir,
+            vpick,
+            str(aid0),
+            str(pid0),
+            args,
+            p3m,
+            None,
+        ) is None:
+            raise SystemExit(1)
+        return
+
     runs = expand_run_specs(catalog)
     phase1_plan_total = len(runs)
     if args.only_run_index:
@@ -1018,6 +1786,11 @@ def main() -> None:
 
         phase1_summary = {
             "generated_utc": _utc_iso(),
+            "file_role": (
+                "Resumen global fase1 (JSON principal). Lee campaign_summary (recursos, medianas) y "
+                "ranking_median_by_approach_best_profile. Detalle: runs[] o phase1_runs/<id>/{metrics,experiment_summary}.json. "
+                "Orquestación sin --save (no output_video; solo pipeline + métricas)."
+            ),
             "catalog_path": str(catalog_path),
             "output_root": str(output_root),
             "campaign_dir": str(campaign_dir),
@@ -1054,6 +1827,7 @@ def main() -> None:
                 "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi durante el run (solo CUDA).",
                 "host_peak_rss_bytes": "Pico RSS del proceso hijo (psutil, si disponible).",
                 "campaign_summary": "Bloque resumido: conteos exito/fallo, tiempos orquestador fase 1, medianas/p90 globales y por approach.",
+                "resource_summary": "Solo en runs con metrics completos: mediana de picos host/GPU; ver resource_fields_glossary en campaign_summary.",
             },
         }
         summary_path = campaign_dir / "phase1_summary.json"
@@ -1084,6 +1858,11 @@ def main() -> None:
                     monitor_psutil=monitor,
                     stream_log=session_log_tuple,
                 )
+                p2["file_role"] = (
+                    "Resumen global fase2 (JSON principal). models[]: un lote por approach con todos los "
+                    "videos en paralelo; resource_summary y runs[] en phase2_runs. Compara con phase1 vía approach_id. "
+                    "Sin --save en orquestación (no output_video por run)."
+                )
                 p2["phase2_orchestrator_wall_sec"] = round(time.perf_counter() - t_p2_0, 3)
                 p2["phase2_selection"] = "all_ranked" if args.phase2_all_ranked else "top2"
                 p2["phase2_models_count"] = len(phase2_entries)
@@ -1098,6 +1877,28 @@ def main() -> None:
                 "[phase2] No hay modelos en el ranking (ningún run con derived_ranking_score válido). "
                 "Revisa fallos en fase 1 y campaign_summary en phase1_summary.json."
             )
+
+        if args.phase3_parallel_sweep and bool(ranked) and ranked[0].get("approach_id"):
+            v3b = _resolve_phase3_video_path(args, catalog)
+            if (args.phase3_sweep_mode or "adaptive") == "fixed" and not _parse_phase3_steps_str(
+                str(args.phase3_steps or "")
+            ):
+                print(
+                    "[phase3] Modo fixed: omiso (--phase3-steps vacío o sin enteros). "
+                    "Usa adaptivo o fija N en --phase3-steps.",
+                    file=sys.stderr,
+                )
+            elif v3b and v3b.is_file():
+                _phase3_run_write(
+                    catalog,
+                    campaign_dir,
+                    v3b,
+                    str((args.phase3_approach or "").strip() or str(ranked[0]["approach_id"])),
+                    str((args.phase3_profile or "").strip() or str(ranked[0]["profile_id"])),
+                    args,
+                    monitor,
+                    session_log_tuple,
+                )
 
         # Si hubo excepcion antes, este bloque no corre (no aparece FINALIZADO en el log).
         orch_end = _utc_iso()
