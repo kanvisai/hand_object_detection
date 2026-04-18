@@ -36,7 +36,6 @@ HF_HUB_MODELS: list[tuple[str, str]] = [
     ("qwen2vl", "Qwen/Qwen2-VL-2B-Instruct"),
     ("qwen3vl", "Qwen/Qwen3-VL-2B-Instruct"),
     ("internvl2", "OpenGVLab/InternVL2-2B"),
-    ("internvl3", "OpenGVLab/InternVL3-2B"),
     ("paligemma", "google/paligemma2-3b-pt-224"),
     ("moondream", "vikhyatk/moondream2"),
     ("florence2_base", "florence-community/Florence-2-base"),

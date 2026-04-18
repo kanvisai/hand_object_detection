@@ -12,6 +12,7 @@ phase1_summary/phase2_parallel incluyen `resource_summary` (CPU, RAM, VRAM) agre
 Fase 3 opcional (--phase3-parallel-sweep o --only-phase3): el mismo approach y un vídeo, N subprocesos
 en paralelo. Por defecto barrido adaptativo (dobla N y refina por búsqueda binaria) hasta fallo, OOM o
 tope --phase3-max-parallel. Con --phase3-sweep-mode fixed se usa --phase3-steps. Ver phase3_parallel_sweep_summary.json.
+Fases 3 y 4 fuerzan stride de pipeline PHASE34_PIPELINE_STRIDE (3), independiente del perfil del catálogo.
 
 Fase 4 (--phase4-parallel-sweep o --only-phase4): repite el barrido de fase 3 para cada approach del
 catálogo (mismo vídeo y perfil), estima N máximo por modelo y agrega min/mediana/max de latency_sec en
@@ -53,6 +54,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 APPROACHES_DIR = Path(__file__).resolve().parent
 DEFAULT_CATALOG = APPROACHES_DIR / "experiments_catalog.json"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output_results"
+
+# Fases 3 y 4: stride del pipeline (handobject_shared) fijo; no usa el stride del perfil de catálogo.
+PHASE34_PIPELINE_STRIDE = 3
 
 
 class _TeeIO:
@@ -834,6 +838,144 @@ def summarize_phase1_campaign(
     }
 
 
+def phase1_models_coverage_report(
+    run_results: list[dict[str, Any]],
+    catalog_approaches: list[Any],
+    *,
+    phase1_plan_total: int,
+    only_run_index: int | None,
+) -> dict[str, Any]:
+    """
+    Por approach: cuántos runs OK vs fallidos; lista modelos totalmente OK, parciales o todos mal.
+    """
+    script_by_id: dict[str, str] = {}
+    expected_ids: list[str] = []
+    for a in catalog_approaches or []:
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get("id") or "").strip()
+        if not aid or aid.startswith("_"):
+            continue
+        expected_ids.append(aid)
+        script_by_id[aid] = str(a.get("script") or "")
+
+    grouped: dict[str, dict[str, int]] = {}
+    for r in run_results:
+        aid = str(r.get("approach_id") or "")
+        if not aid:
+            continue
+        if aid not in grouped:
+            grouped[aid] = {"runs": 0, "successes": 0, "failures": 0}
+        grouped[aid]["runs"] += 1
+        if r.get("success"):
+            grouped[aid]["successes"] += 1
+        else:
+            grouped[aid]["failures"] += 1
+
+    by_app: dict[str, Any] = {}
+    full_success: list[str] = []
+    partial: list[str] = []
+    all_failed: list[str] = []
+
+    for aid in sorted(grouped.keys()):
+        g = grouped[aid]
+        rc, sc, fc = int(g["runs"]), int(g["successes"]), int(g["failures"])
+        if fc == 0 and sc > 0:
+            st = "ok"
+            full_success.append(aid)
+        elif sc == 0 and fc > 0:
+            st = "all_failed"
+            all_failed.append(aid)
+        elif sc > 0 and fc > 0:
+            st = "partial"
+            partial.append(aid)
+        else:
+            st = "unknown"
+        by_app[aid] = {
+            "script": script_by_id.get(aid, ""),
+            "runs": rc,
+            "successes": sc,
+            "failures": fc,
+            "status": st,
+        }
+
+    executed_ids = set(grouped.keys())
+    missing = [e for e in expected_ids if e not in executed_ids]
+
+    return {
+        "by_approach": by_app,
+        "approaches_full_success": sorted(full_success),
+        "approaches_partial_failure": sorted(partial),
+        "approaches_all_runs_failed": sorted(all_failed),
+        "approaches_not_executed_this_phase": sorted(missing),
+        "phase1_plan_total_runs": phase1_plan_total,
+        "phase1_executed_run_records": len(run_results),
+        "note_only_run_index": (
+            f"Solo se ejecutó el run de plan #{only_run_index}; "
+            "los demás approaches no corren en esta sesión."
+            if only_run_index
+            else ""
+        ),
+    }
+
+
+def print_phase1_models_coverage(cov: dict[str, Any]) -> None:
+    """Salida legible tras fase 1."""
+    sep = "=" * 72
+    print(sep)
+    print("Fase 1 — resumen por modelo (approach)")
+    print(sep)
+    ok = cov.get("approaches_full_success") or []
+    part = cov.get("approaches_partial_failure") or []
+    bad = cov.get("approaches_all_runs_failed") or []
+    skip = cov.get("approaches_not_executed_this_phase") or []
+    by_app = cov.get("by_approach") or {}
+
+    def _line(label: str, ids: list[str]) -> None:
+        if not ids:
+            print(f"  · {label}: (ninguno)")
+            return
+        parts: list[str] = []
+        for aid in ids:
+            ba = by_app.get(aid) if isinstance(by_app, dict) else None
+            if isinstance(ba, dict) and ba.get("runs"):
+                parts.append(f"{aid} ({ba.get('successes')}/{ba.get('runs')} OK)")
+            else:
+                parts.append(aid)
+        print(f"  · {label}: {', '.join(parts)}")
+
+    _line("Todos los runs OK", list(ok))
+    _line("Algún run fallido (parcial)", list(part))
+    _line("Todos los runs fallidos", list(bad))
+    note_idx = str(cov.get("note_only_run_index") or "").strip()
+    if note_idx:
+        print(f"  · Nota: {note_idx}")
+        if skip:
+            print(
+                "  · No ejecutados en esta sesión (esperado con --only-run-index): "
+                f"{', '.join(skip)}"
+            )
+    elif skip:
+        print(
+            "  · Sin runs en esta fase (matriz/catálogo): "
+            f"{', '.join(skip)}"
+        )
+
+    total_exec = int(cov.get("phase1_executed_run_records") or 0)
+    plan_total = int(cov.get("phase1_plan_total_runs") or 0)
+    print(f"  · Registros de run en esta fase: {total_exec} (plan fase 1: {plan_total} combinaciones).")
+    if ok and not part and not bad and not skip:
+        print("  · Resultado: todos los modelos ejecutados han completado sin fallos.")
+    elif not ok and not part and bad and note_idx:
+        pass
+    elif bad or part:
+        print(
+            "  · Revisa stderr/metrics en phase1_runs/<run_id>/ por approach con fallos "
+            "(phase1_summary.json → runs[] / campaign_summary)."
+        )
+    print(sep)
+
+
 def rank_approaches_for_phase2(
     run_results: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1180,6 +1322,7 @@ def run_phase3_parallel_sweep(
     merged_base = build_merged_for_phase2(catalog, approach_id, profile_id)
     if ap_obj.get("vlm_model"):
         merged_base["vlm_model"] = ap_obj["vlm_model"]
+    merged_base["stride"] = PHASE34_PIPELINE_STRIDE
 
     if sweep_mode not in ("adaptive", "fixed"):
         raise RuntimeError("sweep_mode debe ser 'adaptive' o 'fixed'")
@@ -1379,6 +1522,10 @@ def run_phase3_parallel_sweep(
         "sweep_mode": sweep_mode,
         "approach_id": approach_id,
         "profile_id": profile_id,
+        "pipeline_stride": PHASE34_PIPELINE_STRIDE,
+        "pipeline_stride_note": (
+            "Fase 3/4 fuerzan este stride en CLI; el perfil del catálogo puede tener otro valor para fase 1/2."
+        ),
         "video_path": str(video_path.resolve()),
         "n_steps_tried": n_tried_order if sweep_mode == "adaptive" else n_sorted,
         "adaptive_search": adaptive_meta if sweep_mode == "adaptive" else None,
@@ -1893,6 +2040,7 @@ def run_phase4_multi_model_sweep(
             "phase3_max_parallel": int(getattr(args, "phase3_max_parallel", 64) or 64),
             "phase3_pause_sec": float(args.phase3_pause_sec),
             "phase3_min_free_ram_mib": int(args.phase3_min_free_ram_mib),
+            "pipeline_stride": PHASE34_PIPELINE_STRIDE,
         },
         "metrics_glossary": {
             "latency_vlm_calls.min_sec": "Mínimo latency_sec entre llamadas al clasificador en el run N=1.",
@@ -2357,6 +2505,12 @@ def main() -> None:
             top2,
             phase1_wall_sec=t_phase1_1 - t_phase1_0,
         )
+        phase1_models_cov = phase1_models_coverage_report(
+            run_results,
+            catalog.get("approaches") or [],
+            phase1_plan_total=int(phase1_plan_total),
+            only_run_index=int(args.only_run_index) if getattr(args, "only_run_index", None) else None,
+        )
 
         phase1_summary = {
             "generated_utc": _utc_iso(),
@@ -2384,6 +2538,7 @@ def main() -> None:
             "phase1_plan_total_runs": phase1_plan_total,
             "phase1_only_run_index": int(args.only_run_index) if args.only_run_index else None,
             "campaign_summary": campaign_summary,
+            "phase1_models_coverage": phase1_models_cov,
             "runs": run_results,
             "ranking_median_by_approach_best_profile": ranked,
             "phase2_top2": top2,
@@ -2401,6 +2556,10 @@ def main() -> None:
                 "nvidia_gpu_utilization_mean_percent": "Media muestreos nvidia-smi durante el run (solo CUDA).",
                 "host_peak_rss_bytes": "Pico RSS del proceso hijo (psutil, si disponible).",
                 "campaign_summary": "Bloque resumido: conteos exito/fallo, tiempos orquestador fase 1, medianas/p90 globales y por approach.",
+                "phase1_models_coverage": (
+                    "Por approach: runs OK vs fallidos, listas approaches_full_success / partial / all_failed; "
+                    "approaches_not_executed_this_phase si matriz no los incluyo o --only-run-index."
+                ),
                 "resource_summary": "Solo en runs con metrics completos: mediana de picos host/GPU; ver resource_fields_glossary en campaign_summary.",
             },
         }
@@ -2408,6 +2567,7 @@ def main() -> None:
         with open(summary_path, "w", encoding="utf-8") as jf:
             json.dump(phase1_summary, jf, indent=2, ensure_ascii=False)
         print(f"[ok] Resumen fase 1: {summary_path}")
+        print_phase1_models_coverage(phase1_models_cov)
 
         do_phase2 = bool(args.phase2)
         phase2_entries = list(ranked) if args.phase2_all_ranked else top2

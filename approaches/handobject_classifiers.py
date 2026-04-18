@@ -755,7 +755,7 @@ class Qwen3VLHandClassifier(Qwen2VLHandClassifier):
 class GenericChatVLMClassifier(YesNoTextMixin):
     """VLM con chat tipo Qwen2 (imagen + texto) y generate; para InternVL, SmolVLM, PaliGemma, etc."""
 
-    _INTERNVL_BACKENDS = frozenset({"internvl2", "internvl3"})
+    _INTERNVL_BACKENDS = frozenset({"internvl2"})
     # openbmb/MiniCPM-V-*: tokenizer remoto importa peft; inferencia oficial = model.chat(image, msgs, context, tokenizer).
     _MINICPM_BACKENDS = frozenset({"minicpm_v20", "minicpm_v26"})
     # microsoft/Phi-3.5-vision-instruct: Phi3VConfig no esta en AutoModelForVision2Seq; el Hub pide flash_attn si el config usa flash.

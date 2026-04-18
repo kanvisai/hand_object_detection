@@ -62,7 +62,6 @@ _REL_CPU_PER_VIDEO_SEC: dict[str, tuple[float, float]] = {
     "qwen2vl": (18.0, 2.5),
     "qwen3vl": (18.0, 2.5),
     "internvl2": (35.0, 4.0),
-    "internvl3": (35.0, 4.0),
     "paligemma": (28.0, 3.5),
     "moondream": (22.0, 3.0),
     "florence2_base": (12.0, 2.0),

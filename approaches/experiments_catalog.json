@@ -33,7 +33,6 @@
     {"id": "qwen2vl", "script": "test_new_handobject_qwenvl.py"},
     {"id": "qwen3vl", "script": "test_new_handobject_qwen3_vl.py"},
     {"id": "internvl2", "script": "test_new_handobject_internvl2.py"},
-    {"id": "internvl3", "script": "test_new_handobject_internvl3.py"},
     {"id": "paligemma", "script": "test_new_handobject_paligemma.py"},
     {"id": "moondream", "script": "test_new_handobject_moondream.py"},
     {"id": "florence2_base", "script": "test_new_handobject_florence2_base.py"},
