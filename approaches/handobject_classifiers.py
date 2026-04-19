@@ -103,6 +103,34 @@ def _nuke_all_transformers_modules_remote_code_dirs() -> bool:
         return True
 
 
+def _nuke_hf_hub_repo_cache_if_hub_id(model_ref: str) -> bool:
+    """
+    Borra .../hub/models--Org--repo/ para forzar re-descarga del snapshot del Hub.
+    No aplica a rutas locales existentes ni a refs que no sean org/repo.
+    """
+    p = Path(model_ref).expanduser()
+    if p.is_dir() and p.exists():
+        return False
+    s = str(model_ref).strip()
+    if "/" not in s or s.startswith("."):
+        return False
+    org, sep, repo = s.partition("/")
+    if not sep or not org or not repo or ".." in s:
+        return False
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    hub_dir = hf_home / "hub" / f"models--{org}--{repo}"
+    if not hub_dir.is_dir():
+        return False
+    try:
+        shutil.rmtree(hub_dir)
+        importlib.invalidate_caches()
+        return True
+    except OSError:
+        shutil.rmtree(hub_dir, ignore_errors=True)
+        importlib.invalidate_caches()
+        return True
+
+
 def _try_remove_broken_transformers_remote_code_cache(exc: BaseException) -> bool:
     """
     trust_remote_code descarga modulos Python bajo ~/.cache/huggingface/modules/transformers_modules/<hash>/.
@@ -1085,15 +1113,18 @@ class MoondreamHandClassifier(YesNoTextMixin):
         kw = {"trust_remote_code": True, "torch_dtype": dt}
         self.model = None
         last_err: BaseException | None = None
-        for attempt in range(5):
+        for attempt in range(6):
             try:
                 use_kw = dict(kw)
                 if attempt >= 2:
                     # Tras varios fallos por modulos sueltos, forzar re-descarga del snapshot.
                     use_kw["force_download"] = True
-                if attempt >= 4:
-                    # Ultimo intento: caché de código remoto a menudo queda inconsistente (falta layers.py).
+                if attempt >= 2:
+                    # Sin esto suele repetirse FileNotFoundError (p.ej. lora.py) aunque se borre un hash.
                     _nuke_all_transformers_modules_remote_code_dirs()
+                if attempt >= 4:
+                    # Snapshot del repo en hub a veces queda a medias; fuerza descarga completa.
+                    _nuke_hf_hub_repo_cache_if_hub_id(load_id)
                 self.model = AutoModelForCausalLM.from_pretrained(load_id, **use_kw).to(self.device)
                 break
             except FileNotFoundError as e:
@@ -1107,10 +1138,12 @@ class MoondreamHandClassifier(YesNoTextMixin):
                     "y vuelve a ejecutar."
                 ) from e
         if self.model is None and last_err is not None:
+            hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
             raise RuntimeError(
                 "Moondream: no se pudo cargar el modelo tras reintentos. "
-                f"Ultimo error: {last_err!s}. Borra ~/.cache/huggingface/modules/transformers_modules/ "
-                "y el snapshot del modelo en hub si hace falta."
+                f"Ultimo error: {last_err!s}. Borra caché de codigo remoto y del modelo, p. ej.: "
+                f"rm -rf {hf_home}/modules/transformers_modules/ "
+                f"y si sigue fallando tambien {hf_home}/hub/models--*--moondream2/ (ajusta el nombre al repo)."
             ) from last_err
         assert self.model is not None
         self.model.eval()

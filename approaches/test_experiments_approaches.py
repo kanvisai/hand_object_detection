@@ -1146,11 +1146,18 @@ def _nvidia_gpu_mem_used_mib() -> int | None:
 
 
 def _mem_monitor_loop(stop: threading.Event, out: dict[str, Any]) -> None:
+    if psutil is not None:
+        try:
+            psutil.cpu_percent(interval=0.05)
+        except (OSError, RuntimeError, AttributeError):
+            pass
     while not stop.wait(0.2):
         if psutil is not None:
             try:
                 u = int(psutil.virtual_memory().used)
                 out["host_used_max"] = max(int(out.get("host_used_max", 0)), u)
+                cp = float(psutil.cpu_percent(interval=None))
+                out["cpu_percent_max"] = max(float(out.get("cpu_percent_max", 0.0)), cp)
             except (OSError, RuntimeError, AttributeError):
                 break
         nvm = _nvidia_gpu_mem_used_mib()
@@ -1214,7 +1221,7 @@ def _phase3_execute_n_batch(
 ) -> tuple[dict[str, Any], bool, bool]:
     """Un lote con N subprocesos. Devuelve (step_entry, all_success, oom_suspect)."""
     step_dir.mkdir(parents=True, exist_ok=True)
-    peaks: dict[str, Any] = {"host_used_max": 0, "nv_mem_max_mib": None}
+    peaks: dict[str, Any] = {"host_used_max": 0, "nv_mem_max_mib": None, "cpu_percent_max": 0.0}
     stop_m = threading.Event()
     t_mon = threading.Thread(target=_mem_monitor_loop, args=(stop_m, peaks), daemon=True)
     t_mon.start()
@@ -1276,6 +1283,9 @@ def _phase3_execute_n_batch(
         "mean_subprocess_wall_sec": (round(sum(sw) / len(sw), 6) if sw else None),
         "peak_host_memory_used_bytes_during_batch": int(peaks["host_used_max"])
         if int(peaks.get("host_used_max", 0) or 0) > 0
+        else None,
+        "peak_host_cpu_percent_during_batch": round(float(peaks["cpu_percent_max"]), 2)
+        if psutil is not None
         else None,
         "peak_nvidia_gpu_mem_used_mib_smi": int(peaks["nv_mem_max_mib"])
         if peaks.get("nv_mem_max_mib") is not None
@@ -1755,6 +1765,8 @@ def _phase4_capacity_cloud_metrics(p_inner: dict[str, Any]) -> dict[str, Any]:
             "batch_wall_clock_sec": bw,
             "mean_pipeline_wall_sec": mw,
             "mean_subprocess_wall_sec": s.get("mean_subprocess_wall_sec"),
+            "peak_host_memory_used_bytes_during_batch": s.get("peak_host_memory_used_bytes_during_batch"),
+            "peak_host_cpu_percent_during_batch": s.get("peak_host_cpu_percent_during_batch"),
             "peak_nvidia_gpu_mem_used_mib_smi": s.get("peak_nvidia_gpu_mem_used_mib_smi"),
             "sum_host_peak_rss_mib_from_runs": s.get("sum_host_peak_rss_mib_from_runs"),
         }
@@ -1773,6 +1785,22 @@ def _phase4_capacity_cloud_metrics(p_inner: dict[str, Any]) -> dict[str, Any]:
                 float(nn) * float(dur_clip) / float(bw), 6
             )
         out["parallel_scaling_steps"].append(entry_sc)
+
+    steps_ps = out["parallel_scaling_steps"]
+    nv_list = [x.get("peak_nvidia_gpu_mem_used_mib_smi") for x in steps_ps if x.get("peak_nvidia_gpu_mem_used_mib_smi") is not None]
+    hb_list = [x.get("peak_host_memory_used_bytes_during_batch") for x in steps_ps if x.get("peak_host_memory_used_bytes_during_batch") is not None]
+    cpu_list = [x.get("peak_host_cpu_percent_during_batch") for x in steps_ps if x.get("peak_host_cpu_percent_during_batch") is not None]
+    out["sweep_maxima_over_all_steps"] = {
+        "note": (
+            "Maximos entre todos los pasos del barrido (incluye lotes fallidos por OOM); "
+            "VRAM = nvidia-smi memory.used del dispositivo; RAM host = psutil.virtual_memory().used del sistema; "
+            "CPU = maximo de psutil.cpu_percent() (uso CPU global) durante el muestreo del lote."
+        ),
+        "peak_nvidia_gpu_mem_used_mib_smi_max": int(max(nv_list)) if nv_list else None,
+        "peak_host_memory_used_bytes_max": int(max(hb_list)) if hb_list else None,
+        "peak_host_memory_used_gib_max": round(float(max(hb_list)) / (1024.0**3), 4) if hb_list else None,
+        "peak_host_cpu_percent_max": round(float(max(cpu_list)), 4) if cpu_list else None,
+    }
 
     n1_step = next(
         (x for x in steps if int(x.get("n_parallel") or 0) == 1 and x.get("all_success")),
@@ -1992,10 +2020,17 @@ def run_phase4_multi_model_sweep(
 
             entry["capacity_cloud_metrics"] = _phase4_capacity_cloud_metrics(p_inner)
 
-            entry["last_fully_successful_n_parallel"] = p_inner.get("last_fully_successful_n_parallel")
+            n_ok = int(p_inner.get("last_fully_successful_n_parallel") or 0)
+            entry["last_fully_successful_n_parallel"] = n_ok
             entry["sweep_ended_because"] = p_inner.get("sweep_ended_because")
             entry["n_steps_tried"] = p_inner.get("n_steps_tried")
             entry["parallel_sweep_detail_json"] = str(frag.resolve())
+            if n_ok == 0:
+                print(
+                    f"[phase4] Omitido del resumen (last_fully_successful_n_parallel=0): {aid}",
+                    flush=True,
+                )
+                continue
             models.append(entry)
         except Exception as exc:  # pragma: no cover
             models.append(
@@ -2017,6 +2052,11 @@ def run_phase4_multi_model_sweep(
             pass
         time.sleep(max(0.0, float(getattr(args, "phase3_pause_sec", 2.0))))
 
+    models.sort(
+        key=lambda m: int(m.get("last_fully_successful_n_parallel") or 0),
+        reverse=True,
+    )
+
     return {
         "generated_utc": _utc_iso(),
         "phase": 4,
@@ -2027,7 +2067,9 @@ def run_phase4_multi_model_sweep(
         "file_role": (
             "Resumen fase 4: barrido paralelo N por cada approach (mismo vídeo y perfil). "
             "Models[] incluye latency_vlm_calls, pipeline_single_stream y capacity_cloud_metrics "
-            "(VRAM/RSS/utilización/curva N/throughput proxies). "
+            "(VRAM/RSS/CPU/picos del barrido completo). "
+            "Orden: last_fully_successful_n_parallel descendente. "
+            "No se listan approaches con last_fully_successful_n_parallel=0 (p. ej. modelo que falla incluso en N=1). "
             "derived_wall_clock_per_10s_video_sec ≈ tiempo de pipeline para 10 s de vídeo real "
             "(mismo cociente wall/duración × 10)."
         ),
@@ -2050,8 +2092,12 @@ def run_phase4_multi_model_sweep(
             ),
             "last_fully_successful_n_parallel": "Igual que fase 3: máximo N con todos los subprocesos OK sin OOM.",
             "capacity_cloud_metrics.parallel_scaling_steps": (
-                "Por cada N probado: tiempos de lote/pipeline, RSS sumada, memoria GPU vía nvidia-smi si hubo; "
-                "estimated_* son proxies con duración del clip tomada del metrics N=1."
+                "Por cada N: tiempos, RSS sumada por proceso, pico RAM host (psutil used), CPU% max en el lote, "
+                "pico VRAM nvidia-smi; estimated_* si el paso fue OK."
+            ),
+            "capacity_cloud_metrics.sweep_maxima_over_all_steps": (
+                "Maximos entre todos los pasos (incluye lotes fallidos): VRAM dispositivo, RAM host, CPU% "
+                "(ver nota interna)."
             ),
             "capacity_cloud_metrics.single_stream_process_resources": (
                 "Medianas sobre runs del lote N=1 OK: pico PyTorch VRAM, RSS host, utilización GPU y memoria nvidia-smi."
