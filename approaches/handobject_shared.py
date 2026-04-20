@@ -295,6 +295,11 @@ def build_parser(
         help="Margen de duda para lanzar 2a inferencia en --per-hand-fast.",
     )
     ap.add_argument("--device", default="cpu", help="cpu o cuda:0")
+    ap.add_argument(
+        "--no-tensorrt",
+        action="store_true",
+        help="No usar TensorRT (.engine junto al .pt) aunque exista; evita fallos si CUDA/TRT no van.",
+    )
     ap.add_argument("--stride", type=int, default=2, help="Evalua cada N frames.")
     ap.add_argument("--display", default="1280x720", choices=["1280x720", "1920x1080"])
     ap.add_argument(
@@ -851,9 +856,10 @@ def update_temporal_state(
         hs.off_count = max(hs.off_count, drop_frames)
 
 
-def resolve_yolo_weights_for_runtime(weights_arg: str) -> str:
+def resolve_yolo_weights_for_runtime(weights_arg: str, *, allow_tensorrt: bool = True) -> str:
     """
     Si la ruta apunta a un .pt y existe un .engine en el mismo directorio, usar el .engine (TensorRT).
+    Si allow_tensorrt es False (p. ej. --device cpu o --no-tensorrt), se mantiene el .pt.
     Busca el .pt en cwd, junto a handobject_shared.py (approaches/) y ruta absoluta.
     Para yolo11n*.pt conocidos, si no existen en esas rutas, los descarga en approaches/.
     """
@@ -880,7 +886,7 @@ def resolve_yolo_weights_for_runtime(weights_arg: str) -> str:
         return ws
     if p.suffix.lower() == ".pt":
         eng = p.with_suffix(".engine")
-        if eng.is_file():
+        if eng.is_file() and allow_tensorrt:
             return str(eng.resolve())
     return str(p.resolve())
 
@@ -918,11 +924,24 @@ def run_pipeline(
 ) -> None:
     if bool(str(args.video).strip()) == bool(str(args.videos).strip()):
         raise RuntimeError("Debes indicar exactamente uno: --video o --videos.")
-    args.pose_weights = resolve_yolo_weights_for_runtime(str(args.pose_weights))
-    args.personal_weights = resolve_yolo_weights_for_runtime(str(args.personal_weights))
+    predict_dev = yolo_predict_device_for_args(args)
+    allow_trt = (
+        not bool(getattr(args, "no_tensorrt", False))
+        and predict_dev != "cpu"
+        and torch.cuda.is_available()
+    )
+    if not allow_trt:
+        if bool(getattr(args, "no_tensorrt", False)):
+            print("[yolo] --no-tensorrt: usando .pt (no TensorRT .engine).", flush=True)
+        elif predict_dev == "cpu":
+            print(
+                "[yolo] Dispositivo cpu: usando .pt (no TensorRT .engine aunque exista).",
+                flush=True,
+            )
+    args.pose_weights = resolve_yolo_weights_for_runtime(str(args.pose_weights), allow_tensorrt=allow_trt)
+    args.personal_weights = resolve_yolo_weights_for_runtime(str(args.personal_weights), allow_tensorrt=allow_trt)
     pose_trt = _weights_is_tensorrt(str(args.pose_weights))
     personal_trt = _weights_is_tensorrt(str(args.personal_weights))
-    predict_dev = yolo_predict_device_for_args(args)
 
     # task explícito evita el aviso "Unable to automatically guess model task" de ultralytics
     pose_model = YOLO(str(args.pose_weights), task="pose")
