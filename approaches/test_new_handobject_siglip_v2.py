@@ -42,17 +42,6 @@ def main() -> None:
     args.crop_max = max(int(args.crop_max), 420)
     args.crop_size = max(int(args.crop_size), 260)
     args.fast_gray_zone = max(float(args.fast_gray_zone), 0.24)
-    # Regla solicitada: YES solo si p_yes > 0.80 en 2 frames consecutivos.
-    # En cualquier otro caso, NO/soltado con caida rapida.
-    args.yes_th = 0.80
-    args.hold_frames = 2
-    args.drop_frames = 1
-    args.raw_on_th = 0.80
-    args.raw_on_frames = 2
-    args.force_drop_th = 0.80
-    args.force_drop_frames = 1
-    args.raw_drop_th = 0.80
-    args.raw_drop_frames = 1
     clf = SiglipSO400MClassifier(args.vlm_model, args.device, args.vlm_prompt)
     run_pipeline(
         args,

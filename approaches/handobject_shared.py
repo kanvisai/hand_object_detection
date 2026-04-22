@@ -333,6 +333,24 @@ def build_parser(
     ap.add_argument("--hold-frames", type=int, default=3)
     ap.add_argument("--drop-frames", type=int, default=3)
     ap.add_argument(
+        "--robbery-th",
+        type=float,
+        default=0.80,
+        help="Umbral de robo: se considera YES solo si probabilidad > este valor.",
+    )
+    ap.add_argument(
+        "--robbery-on-frames",
+        type=int,
+        default=3,
+        help="Frames consecutivos con prob > --robbery-th para activar robo.",
+    )
+    ap.add_argument(
+        "--robbery-off-frames",
+        type=int,
+        default=3,
+        help="Frames consecutivos con prob < --robbery-th para desactivar robo.",
+    )
+    ap.add_argument(
         "--raw-on-th",
         type=float,
         default=-1.0,
@@ -877,19 +895,29 @@ def update_temporal_state(
         # Modo estricto: entrada/salida gobernada por la probabilidad raw de este frame.
         if hs.raw_prob > raw_on_th:
             hs.raw_high_count += 1
-        else:
+            hs.off_count = 0
+            hs.on_count = hs.raw_high_count
+        elif hs.raw_prob < raw_on_th:
             hs.raw_high_count = 0
+            hs.off_count += 1
+            hs.on_count = 0
+        else:
+            # En igualdad exacta no activar ni desactivar.
+            hs.raw_high_count = 0
+            hs.on_count = 0
+            hs.off_count = 0
         is_yes_now = hs.raw_prob > raw_on_th
     else:
         hs.raw_high_count = 0
         is_yes_now = hs.prob >= yes_th
 
-    if is_yes_now:
-        hs.on_count += 1
-        hs.off_count = 0
-    else:
-        hs.off_count += 1
-        hs.on_count = 0
+    if not use_raw_on_gate:
+        if is_yes_now:
+            hs.on_count += 1
+            hs.off_count = 0
+        else:
+            hs.off_count += 1
+            hs.on_count = 0
     # Anti-stick: si la evidencia es claramente baja varios ciclos, soltar.
     if hs.prob < force_drop_th:
         hs.weak_count += 1
@@ -983,6 +1011,9 @@ def run_pipeline(
     if bool(str(args.video).strip()) == bool(str(args.videos).strip()):
         raise RuntimeError("Debes indicar exactamente uno: --video o --videos.")
     predict_dev = yolo_predict_device_for_args(args)
+    robbery_th = float(getattr(args, "robbery_th", -1.0))
+    robbery_on_frames = max(1, int(getattr(args, "robbery_on_frames", 3)))
+    robbery_off_frames = max(1, int(getattr(args, "robbery_off_frames", 3)))
     allow_trt = (
         not bool(getattr(args, "no_tensorrt", False))
         and predict_dev != "cpu"
@@ -1261,7 +1292,8 @@ def run_pipeline(
                             if dbg_txt:
                                 print(f"[f={frame_i} id={tid} side=person] DEBUG: {dbg_txt}")
 
-                        tr.prompt_yes = any(p >= 0.5 for p in side_probs.values())
+                        prompt_yes_th = robbery_th if robbery_th > 0.0 else 0.5
+                        tr.prompt_yes = any(p > prompt_yes_th for p in side_probs.values())
                         if tr.prompt_yes:
                             prompt_yes_state = True
                             side_obj = max(det_active_sides, key=lambda s: side_probs.get(s, 0.0))
@@ -1274,15 +1306,21 @@ def run_pipeline(
                                 hs=tr.hands[side],
                                 yes_prob=p_side,
                                 frame_i=frame_i,
-                                yes_th=float(args.yes_th),
-                                hold_frames=int(args.hold_frames),
-                                drop_frames=int(args.drop_frames),
-                                force_drop_th=float(args.force_drop_th),
-                                force_drop_frames=int(args.force_drop_frames),
-                                raw_drop_th=float(args.raw_drop_th),
-                                raw_drop_frames=int(args.raw_drop_frames),
-                                raw_on_th=float(args.raw_on_th),
-                                raw_on_frames=int(args.raw_on_frames),
+                                yes_th=robbery_th if robbery_th > 0.0 else float(args.yes_th),
+                                hold_frames=robbery_on_frames if robbery_th > 0.0 else int(args.hold_frames),
+                                drop_frames=robbery_off_frames if robbery_th > 0.0 else int(args.drop_frames),
+                                force_drop_th=robbery_th if robbery_th > 0.0 else float(args.force_drop_th),
+                                force_drop_frames=robbery_off_frames
+                                if robbery_th > 0.0
+                                else int(args.force_drop_frames),
+                                raw_drop_th=robbery_th if robbery_th > 0.0 else float(args.raw_drop_th),
+                                raw_drop_frames=robbery_off_frames
+                                if robbery_th > 0.0
+                                else int(args.raw_drop_frames),
+                                raw_on_th=robbery_th if robbery_th > 0.0 else float(args.raw_on_th),
+                                raw_on_frames=robbery_on_frames
+                                if robbery_th > 0.0
+                                else int(args.raw_on_frames),
                             )
                         if tr.prompt_yes:
                             # VALOR1: guardar posicion de muñeca de la mano con mayor probabilidad YES.
@@ -1308,15 +1346,15 @@ def run_pipeline(
                             hs=tr.hands[side],
                             yes_prob=0.0,
                             frame_i=frame_i,
-                            yes_th=float(args.yes_th),
-                            hold_frames=int(args.hold_frames),
-                            drop_frames=int(args.drop_frames),
-                            force_drop_th=float(args.force_drop_th),
+                            yes_th=robbery_th if robbery_th > 0.0 else float(args.yes_th),
+                            hold_frames=robbery_on_frames if robbery_th > 0.0 else int(args.hold_frames),
+                            drop_frames=robbery_off_frames if robbery_th > 0.0 else int(args.drop_frames),
+                            force_drop_th=robbery_th if robbery_th > 0.0 else float(args.force_drop_th),
                             force_drop_frames=1,
-                            raw_drop_th=float(args.raw_drop_th),
+                            raw_drop_th=robbery_th if robbery_th > 0.0 else float(args.raw_drop_th),
                             raw_drop_frames=1,
-                            raw_on_th=float(args.raw_on_th),
-                            raw_on_frames=int(args.raw_on_frames),
+                            raw_on_th=robbery_th if robbery_th > 0.0 else float(args.raw_on_th),
+                            raw_on_frames=robbery_on_frames if robbery_th > 0.0 else int(args.raw_on_frames),
                         )
                     curr_track_hold = tr.hands["left"].holding or tr.hands["right"].holding
                     # Abrir ventana de refinado tras transición YES->NO o hold->no-hold.
