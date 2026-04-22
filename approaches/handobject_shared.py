@@ -203,6 +203,7 @@ def _mean(xs: list[float]) -> float | None:
 class HandState:
     prob: float = 0.0
     raw_prob: float = 0.0
+    raw_high_count: int = 0
     weak_count: int = 0
     raw_low_count: int = 0
     on_count: int = 0
@@ -320,8 +321,29 @@ def build_parser(
     ap.add_argument("--crop-size", type=int, default=200, help="Tamano base de crop de mano.")
     ap.add_argument("--crop-min", type=int, default=150)
     ap.add_argument("--crop-max", type=int, default=260)
+    ap.add_argument(
+        "--crop-mode",
+        default="hand",
+        choices=["hand", "upper-torso-hands"],
+        help=(
+            "Modo de crop para clasificacion: hand (muneca+codo) o "
+            "upper-torso-hands (torso superior + mano de cada lado)."
+        ),
+    )
     ap.add_argument("--hold-frames", type=int, default=3)
     ap.add_argument("--drop-frames", type=int, default=3)
+    ap.add_argument(
+        "--raw-on-th",
+        type=float,
+        default=-1.0,
+        help="Si >0, activa compuerta de entrada por probabilidad raw (criterio estricto).",
+    )
+    ap.add_argument(
+        "--raw-on-frames",
+        type=int,
+        default=0,
+        help="Frames consecutivos raw > --raw-on-th para activar 'holding' (0 desactiva).",
+    )
     ap.add_argument("--yes-th", type=float, default=0.55, help="Umbral probabilidad mano con objeto.")
     ap.add_argument(
         "--force-drop-th",
@@ -412,8 +434,30 @@ def build_hand_crop(
     crop_size: int,
     crop_min: int,
     crop_max: int,
+    crop_mode: str = "hand",
 ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     h, w = frame.shape[:2]
+    px1, py1, px2, py2 = person_box
+    if crop_mode == "upper-torso-hands":
+        person_w = max(1, px2 - px1)
+        person_h = max(1, py2 - py1)
+        wx, _ = wrist_xy
+        side_sign = -1 if wx <= (px1 + px2) // 2 else 1
+        half_w = int(np.clip(person_w * 0.38, crop_min, crop_max * 2))
+        torso_h = int(np.clip(person_h * 0.68, crop_min, crop_max * 2))
+        cx = int(wx + side_sign * 0.08 * person_w)
+        cy = int(py1 + 0.35 * person_h)
+        x1 = cx - half_w
+        x2 = cx + half_w
+        y1 = cy - torso_h // 2
+        y2 = cy + torso_h // 2
+        x1 = max(px1, x1)
+        y1 = max(py1, y1)
+        x2 = min(px2, x2)
+        y2 = min(py2, y2)
+        x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, w, h)
+        return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
+
     wx, wy = wrist_xy
     if elbow_xy is not None:
         ex, ey = elbow_xy
@@ -424,7 +468,6 @@ def build_hand_crop(
     y1 = int(wy - side)
     x2 = int(wx + side)
     y2 = int(wy + side)
-    px1, py1, px2, py2 = person_box
     x1 = max(px1, x1)
     y1 = max(py1, y1)
     x2 = min(px2, x2)
@@ -823,11 +866,25 @@ def update_temporal_state(
     force_drop_frames: int,
     raw_drop_th: float,
     raw_drop_frames: int,
+    raw_on_th: float = -1.0,
+    raw_on_frames: int = 0,
 ) -> None:
     hs.last_seen_frame = frame_i
     hs.raw_prob = yes_prob
     hs.prob = 0.65 * hs.prob + 0.35 * yes_prob
-    if hs.prob >= yes_th:
+    use_raw_on_gate = (raw_on_th > 0.0) and (raw_on_frames > 0)
+    if use_raw_on_gate:
+        # Modo estricto: entrada/salida gobernada por la probabilidad raw de este frame.
+        if hs.raw_prob > raw_on_th:
+            hs.raw_high_count += 1
+        else:
+            hs.raw_high_count = 0
+        is_yes_now = hs.raw_prob > raw_on_th
+    else:
+        hs.raw_high_count = 0
+        is_yes_now = hs.prob >= yes_th
+
+    if is_yes_now:
         hs.on_count += 1
         hs.off_count = 0
     else:
@@ -842,7 +899,8 @@ def update_temporal_state(
         hs.raw_low_count += 1
     else:
         hs.raw_low_count = 0
-    if not hs.holding and hs.on_count >= hold_frames:
+    on_frames_needed = int(raw_on_frames) if use_raw_on_gate else int(hold_frames)
+    if not hs.holding and hs.on_count >= max(1, on_frames_needed):
         hs.holding = True
     if hs.holding and hs.off_count >= drop_frames:
         hs.holding = False
@@ -1143,6 +1201,7 @@ def run_pipeline(
                                 crop_size=int(args.crop_size),
                                 crop_min=int(args.crop_min),
                                 crop_max=int(args.crop_max),
+                                crop_mode=str(args.crop_mode),
                             )
                             p_prob = (
                                 classifier.predict_yes_prob(primary_crop, frame_i, vlm_calls)
@@ -1169,6 +1228,7 @@ def run_pipeline(
                                     crop_size=int(args.crop_size),
                                     crop_min=int(args.crop_min),
                                     crop_max=int(args.crop_max),
+                                    crop_mode=str(args.crop_mode),
                                 )
                                 s_prob = (
                                     classifier.predict_yes_prob(sec_crop, frame_i, vlm_calls)
@@ -1221,6 +1281,8 @@ def run_pipeline(
                                 force_drop_frames=int(args.force_drop_frames),
                                 raw_drop_th=float(args.raw_drop_th),
                                 raw_drop_frames=int(args.raw_drop_frames),
+                                raw_on_th=float(args.raw_on_th),
+                                raw_on_frames=int(args.raw_on_frames),
                             )
                         if tr.prompt_yes:
                             # VALOR1: guardar posicion de muñeca de la mano con mayor probabilidad YES.
@@ -1253,6 +1315,8 @@ def run_pipeline(
                             force_drop_frames=1,
                             raw_drop_th=float(args.raw_drop_th),
                             raw_drop_frames=1,
+                            raw_on_th=float(args.raw_on_th),
+                            raw_on_frames=int(args.raw_on_frames),
                         )
                     curr_track_hold = tr.hands["left"].holding or tr.hands["right"].holding
                     # Abrir ventana de refinado tras transición YES->NO o hold->no-hold.
