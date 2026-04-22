@@ -1300,7 +1300,7 @@ def run_pipeline(
                             tr.hands[primary_side].last_crop_box = primary_box if primary_crop.size > 0 else None
                             answer_txt = getattr(classifier, "last_answer_text", "")
                             print(
-                                f"[f={frame_i} id={tid} side={primary_side}] RESPUESTA: {answer_txt} | yes_prob={p_prob:.3f}"
+                                f"[f={frame_i} id={tid} side={primary_side}] MODELO: {answer_txt} | yes_prob={p_prob:.3f}"
                             )
                             # Si hay segunda mano activa y la principal esta en zona gris, evaluarla tambien.
                             need_second = abs(p_prob - 0.5) <= float(args.fast_gray_zone)
@@ -1327,7 +1327,7 @@ def run_pipeline(
                                 tr.hands[secondary_side].last_crop_box = sec_box if sec_crop.size > 0 else None
                                 answer_txt2 = getattr(classifier, "last_answer_text", "")
                                 print(
-                                    f"[f={frame_i} id={tid} side={secondary_side}] RESPUESTA: {answer_txt2} | yes_prob={s_prob:.3f}"
+                                    f"[f={frame_i} id={tid} side={secondary_side}] MODELO: {answer_txt2} | yes_prob={s_prob:.3f}"
                                 )
                             # Lados no evaluados este ciclo: usar su propio historial suavizado degradado.
                             for s in det_active_sides:
@@ -1344,7 +1344,7 @@ def run_pipeline(
                             p_used = getattr(classifier, "last_prompt_used", args.vlm_prompt)
                             print(f"[f={frame_i} id={tid} side=person] PROMPT: {p_used}")
                             print(
-                                f"[f={frame_i} id={tid} side=person] RESPUESTA: {answer_txt} | yes_prob={yes_prob:.3f}"
+                                f"[f={frame_i} id={tid} side=person] MODELO: {answer_txt} | yes_prob={yes_prob:.3f}"
                             )
                             if dbg_txt:
                                 print(f"[f={frame_i} id={tid} side=person] DEBUG: {dbg_txt}")
@@ -1383,6 +1383,11 @@ def run_pipeline(
                                 acc_step_neg=float(getattr(args, "acc_step_neg", 0.30)),
                                 acc_on_th=float(getattr(args, "acc_on_th", 1.0)),
                                 acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
+                            )
+                            hs_side = tr.hands[side]
+                            print(
+                                f"[f={frame_i} id={tid} side={side}] RESPUESTA: "
+                                f"{'YES' if hs_side.holding else 'NO'} | yes_prob={p_side:.3f}"
                             )
                         any_hold_now = any(tr.hands[s].holding for s in det_active_sides)
                         if any_hold_now:
