@@ -1384,10 +1384,10 @@ def run_pipeline(
                                 acc_on_th=float(getattr(args, "acc_on_th", 1.0)),
                                 acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
                             )
-                        if tr.prompt_yes:
-                            # VALOR1: guardar posicion de muñeca de la mano con mayor probabilidad YES.
+                        any_hold_now = any(tr.hands[s].holding for s in det_active_sides)
+                        if any_hold_now:
+                            # Guardar trayectoria solo cuando el estado "holding" está confirmado.
                             side_best = max(det_active_sides, key=lambda s: side_probs.get(s, 0.0))
-                            # Preferir centro del crop (proxy del objeto) frente a muñeca.
                             lb = tr.hands[side_best].last_crop_box
                             if lb is not None:
                                 x1b, y1b, x2b, y2b = lb
@@ -1425,7 +1425,7 @@ def run_pipeline(
                         )
                     curr_track_hold = tr.hands["left"].holding or tr.hands["right"].holding
                     # Abrir ventana de refinado tras transición YES->NO o hold->no-hold.
-                    if (prev_prompt_yes and (not tr.prompt_yes)) or (prev_track_hold and (not curr_track_hold)):
+                    if prev_track_hold and (not curr_track_hold):
                         # Mostrar resultado inmediato para no perder el texto en casos límite.
                         drop_xy_now = estimate_drop_xy_from_traj(tr.object_traj, int(args.traj_smooth_len))
                         if drop_xy_now is None:

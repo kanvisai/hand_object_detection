@@ -113,7 +113,7 @@ class DifferentialClipLikeClassifier(ClipLikeClassifier):
         p_other_global = float(np.sum(w * p_other))
         margin_ok = (net_global > self.net_margin_th) and (p_obj_global > (p_other_global + 0.05))
         gated_yes = p_obj_global if (margin_ok and net_global > self.net_th) else 0.0
-        self.last_answer_text = "YES" if gated_yes >= 0.5 else "NO"
+        self.last_answer_text = "YES" if gated_yes > 0.0 else "NO"
         self.last_debug = (
             f"p_obj={p_obj_global:.3f} net={net_global:.3f} net_th={self.net_th:.3f} "
             f"net_margin={self.net_margin_th:.3f} p_other={p_other_global:.3f} multi={self.multicrop_mode}"
