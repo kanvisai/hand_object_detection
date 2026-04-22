@@ -1437,7 +1437,8 @@ def run_pipeline(
                     continue
                 x1, y1, x2, y2 = tr.bbox
                 any_hold = tr.hands["left"].holding or tr.hands["right"].holding
-                color = (0, 255, 0) if tr.prompt_yes else (0, 0, 255)
+                # Visual coherente con el criterio temporal final: verde solo si "holding" confirmado.
+                color = (0, 255, 0) if any_hold else (0, 0, 255)
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                 txt = (
                     f"ID {tid} | L:{'YES' if tr.hands['left'].holding else 'NO'}({tr.hands['left'].prob:.2f}/{tr.hands['left'].raw_prob:.2f}) "
@@ -1495,8 +1496,8 @@ def run_pipeline(
                 status_text = "MANOS NO VISIBLES"
                 status_color = (0, 200, 255)
             else:
-                status_text = "Objeto cogido" if prompt_yes_state else "Sin objeto cogido"
-                status_color = (0, 255, 0) if prompt_yes_state else (0, 0, 255)
+                status_text = "Objeto cogido" if any_holding_global else "Sin objeto cogido"
+                status_color = (0, 255, 0) if any_holding_global else (0, 0, 255)
             cv2.putText(vis, status_text, (12, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.95, status_color, 3)
             if nearest_zone_frames_left > 0:
                 cv2.putText(
