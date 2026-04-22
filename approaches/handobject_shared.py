@@ -327,7 +327,7 @@ def build_parser(
         choices=["hand", "upper-torso-hands"],
         help=(
             "Modo de crop para clasificacion: hand (muneca+codo) o "
-            "upper-torso-hands (torso superior + mano de cada lado)."
+            "upper-torso-hands (torso->manos automatico por proporcion corporal)."
         ),
     )
     ap.add_argument("--hold-frames", type=int, default=3)
@@ -459,16 +459,25 @@ def build_hand_crop(
     if crop_mode == "upper-torso-hands":
         person_w = max(1, px2 - px1)
         person_h = max(1, py2 - py1)
-        wx, _ = wrist_xy
+        wx, wy = wrist_xy
         side_sign = -1 if wx <= (px1 + px2) // 2 else 1
-        half_w = int(np.clip(person_w * 0.38, crop_min, crop_max * 2))
-        torso_h = int(np.clip(person_h * 0.68, crop_min, crop_max * 2))
-        cx = int(wx + side_sign * 0.08 * person_w)
-        cy = int(py1 + 0.35 * person_h)
+        # Modo automatico: evita depender de tamanos en pixeles fijos.
+        half_w = max(16, int(round(person_w * 0.36)))
+        torso_top = int(round(py1 + 0.06 * person_h))
+        torso_bottom = int(round(py1 + 0.72 * person_h))
+        if elbow_xy is not None:
+            ex, ey = elbow_xy
+            torso_top = min(torso_top, int(round(min(ey, wy) - 0.06 * person_h)))
+            torso_bottom = max(torso_bottom, int(round(max(ey, wy) + 0.04 * person_h)))
+        torso_top = max(py1, torso_top)
+        torso_bottom = min(py2, torso_bottom)
+        if torso_bottom <= torso_top:
+            torso_bottom = min(py2, torso_top + max(24, int(round(0.55 * person_h))))
+        cx = int(round(wx + side_sign * 0.10 * person_w))
         x1 = cx - half_w
         x2 = cx + half_w
-        y1 = cy - torso_h // 2
-        y2 = cy + torso_h // 2
+        y1 = torso_top
+        y2 = torso_bottom
         x1 = max(px1, x1)
         y1 = max(py1, y1)
         x2 = min(px2, x2)
