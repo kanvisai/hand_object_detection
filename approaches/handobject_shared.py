@@ -204,6 +204,7 @@ class HandState:
     prob: float = 0.0
     raw_prob: float = 0.0
     raw_high_count: int = 0
+    evidence_acc: float = 0.0
     weak_count: int = 0
     raw_low_count: int = 0
     on_count: int = 0
@@ -349,6 +350,36 @@ def build_parser(
         type=int,
         default=3,
         help="Frames consecutivos con prob < --robbery-th para desactivar robo.",
+    )
+    ap.add_argument(
+        "--temporal-mode",
+        default="consecutive",
+        choices=["consecutive", "accumulator"],
+        help="Modo temporal: consecutivos clasico o acumulador con histéresis.",
+    )
+    ap.add_argument(
+        "--acc-step-pos",
+        type=float,
+        default=0.25,
+        help="Incremento del acumulador por evidencia positiva fuerte.",
+    )
+    ap.add_argument(
+        "--acc-step-neg",
+        type=float,
+        default=0.30,
+        help="Decremento del acumulador por evidencia negativa.",
+    )
+    ap.add_argument(
+        "--acc-on-th",
+        type=float,
+        default=1.0,
+        help="Umbral del acumulador para activar estado de objeto cogido.",
+    )
+    ap.add_argument(
+        "--acc-off-th",
+        type=float,
+        default=0.35,
+        help="Umbral del acumulador para desactivar estado de objeto cogido.",
     )
     ap.add_argument(
         "--raw-on-th",
@@ -895,6 +926,11 @@ def update_temporal_state(
     raw_drop_frames: int,
     raw_on_th: float = -1.0,
     raw_on_frames: int = 0,
+    temporal_mode: str = "consecutive",
+    acc_step_pos: float = 0.25,
+    acc_step_neg: float = 0.30,
+    acc_on_th: float = 1.0,
+    acc_off_th: float = 0.35,
 ) -> None:
     hs.last_seen_frame = frame_i
     hs.raw_prob = yes_prob
@@ -936,11 +972,23 @@ def update_temporal_state(
         hs.raw_low_count += 1
     else:
         hs.raw_low_count = 0
-    on_frames_needed = int(raw_on_frames) if use_raw_on_gate else int(hold_frames)
-    if not hs.holding and hs.on_count >= max(1, on_frames_needed):
-        hs.holding = True
-    if hs.holding and hs.off_count >= drop_frames:
-        hs.holding = False
+    if temporal_mode == "accumulator":
+        # Histéresis: acumular evidencia positiva y penalizar negativa.
+        if is_yes_now:
+            hs.evidence_acc += max(0.0, float(acc_step_pos))
+        else:
+            hs.evidence_acc -= max(0.0, float(acc_step_neg))
+        hs.evidence_acc = float(np.clip(hs.evidence_acc, 0.0, max(float(acc_on_th) * 1.5, 1.0)))
+        if (not hs.holding) and hs.evidence_acc >= float(acc_on_th):
+            hs.holding = True
+        if hs.holding and hs.evidence_acc <= float(acc_off_th):
+            hs.holding = False
+    else:
+        on_frames_needed = int(raw_on_frames) if use_raw_on_gate else int(hold_frames)
+        if not hs.holding and hs.on_count >= max(1, on_frames_needed):
+            hs.holding = True
+        if hs.holding and hs.off_count >= drop_frames:
+            hs.holding = False
     if hs.holding and hs.weak_count >= force_drop_frames:
         hs.holding = False
         hs.on_count = 0
@@ -1330,6 +1378,11 @@ def run_pipeline(
                                 raw_on_frames=robbery_on_frames
                                 if robbery_th > 0.0
                                 else int(args.raw_on_frames),
+                                temporal_mode=str(getattr(args, "temporal_mode", "consecutive")),
+                                acc_step_pos=float(getattr(args, "acc_step_pos", 0.25)),
+                                acc_step_neg=float(getattr(args, "acc_step_neg", 0.30)),
+                                acc_on_th=float(getattr(args, "acc_on_th", 1.0)),
+                                acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
                             )
                         if tr.prompt_yes:
                             # VALOR1: guardar posicion de muñeca de la mano con mayor probabilidad YES.
@@ -1364,6 +1417,11 @@ def run_pipeline(
                             raw_drop_frames=1,
                             raw_on_th=robbery_th if robbery_th > 0.0 else float(args.raw_on_th),
                             raw_on_frames=robbery_on_frames if robbery_th > 0.0 else int(args.raw_on_frames),
+                            temporal_mode=str(getattr(args, "temporal_mode", "consecutive")),
+                            acc_step_pos=float(getattr(args, "acc_step_pos", 0.25)),
+                            acc_step_neg=float(getattr(args, "acc_step_neg", 0.30)),
+                            acc_on_th=float(getattr(args, "acc_on_th", 1.0)),
+                            acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
                         )
                     curr_track_hold = tr.hands["left"].holding or tr.hands["right"].holding
                     # Abrir ventana de refinado tras transición YES->NO o hold->no-hold.
@@ -1415,6 +1473,7 @@ def run_pipeline(
                         for hs in tr.hands.values():
                             hs.prob = 0.0
                             hs.raw_prob = 0.0
+                            hs.evidence_acc = 0.0
                             hs.on_count = 0
                             hs.off_count = max(hs.off_count, int(args.drop_frames))
                             hs.weak_count = max(hs.weak_count, int(args.force_drop_frames))
