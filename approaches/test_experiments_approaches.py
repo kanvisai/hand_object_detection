@@ -1223,6 +1223,18 @@ def _parse_phase3_steps_str(s: str) -> list[int]:
     return out
 
 
+def _parse_csv_ids(s: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in (s or "").split(","):
+        t = part.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
 def _phase3_execute_n_batch(
     N: int,
     step_dir: Path,
@@ -2352,6 +2364,14 @@ def main() -> None:
         help="Solo fase 4: barrido N por cada approach del catálogo; requiere --campaign y vídeo válido.",
     )
     ap.add_argument(
+        "--only-phase34",
+        action="store_true",
+        help=(
+            "Solo fases 3 y 4 en cadena, sin fase 1/2. "
+            "Fase 3 acepta varios IDs en --phase3-approach separados por coma; luego fase 4 usa ese mismo conjunto."
+        ),
+    )
+    ap.add_argument(
         "--phase4-parallel-sweep",
         action="store_true",
         help="Tras fase 1/2/(3), ejecuta fase 4 (todos los modelos × mismo vídeo/perfil).",
@@ -2377,8 +2397,11 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    if bool(getattr(args, "only_phase4", False)) and bool(getattr(args, "only_phase3", False)):
-        print("[error] Elige solo uno: --only-phase4 o --only-phase3.", file=sys.stderr)
+    only_modes = int(bool(getattr(args, "only_phase3", False))) + int(bool(getattr(args, "only_phase4", False))) + int(
+        bool(getattr(args, "only_phase34", False))
+    )
+    if only_modes > 1:
+        print("[error] Elige solo uno: --only-phase3, --only-phase4 o --only-phase34.", file=sys.stderr)
         raise SystemExit(2)
 
     catalog_path = args.catalog.expanduser().resolve()
@@ -2444,16 +2467,20 @@ def main() -> None:
             raise SystemExit(1)
         return
 
-    if args.only_phase3:
+    if args.only_phase3 or args.only_phase34:
         if not args.campaign.strip() and not args.unique_campaign:
-            print("[error] --only-phase3 requiere --campaign (carpeta existente bajo --output-root).", file=sys.stderr)
+            print(
+                "[error] --only-phase3/--only-phase34 requiere --campaign (carpeta existente bajo --output-root).",
+                file=sys.stderr,
+            )
             raise SystemExit(1)
         if not campaign_dir.is_dir():
             print(f"[error] no existe la campaña: {campaign_dir}", file=sys.stderr)
             raise SystemExit(1)
         p2f = campaign_dir / "phase2_parallel_summary.json"
         p1f = campaign_dir / "phase1_summary.json"
-        aid0 = (args.phase3_approach or "").strip() or None
+        aid_list = _parse_csv_ids(str(args.phase3_approach or ""))
+        aid0 = aid_list[0] if aid_list else None
         pid0 = (args.phase3_profile or "").strip() or None
         if aid0 is None or pid0 is None:
             if p2f.is_file():
@@ -2489,17 +2516,35 @@ def main() -> None:
             )
             raise SystemExit(1)
         p3m = not args.no_psutil and psutil is not None
-        if _phase3_run_write(
-            catalog,
-            campaign_dir,
-            vpick,
-            str(aid0),
-            str(pid0),
-            args,
-            p3m,
-            None,
-        ) is None:
-            raise SystemExit(1)
+        if not aid_list:
+            aid_list = [str(aid0)]
+        for aid in aid_list:
+            print(f"[phase3] --- {aid} perfil={pid0} ---", flush=True)
+            if _phase3_run_write(
+                catalog,
+                campaign_dir,
+                vpick,
+                str(aid),
+                str(pid0),
+                args,
+                p3m,
+                None,
+            ) is None:
+                raise SystemExit(1)
+        if args.only_phase34:
+            if not (args.phase4_approaches or "").strip():
+                args.phase4_approaches = ",".join(aid_list)
+            pid4 = (args.phase4_profile or "").strip() or str(pid0) or "stride_5"
+            if _phase4_run_write(
+                catalog,
+                campaign_dir,
+                vpick,
+                pid4,
+                args,
+                p3m,
+                None,
+            ) is None:
+                raise SystemExit(1)
         return
 
     runs = expand_run_specs(catalog)
