@@ -2295,6 +2295,14 @@ def main() -> None:
     )
     ap.add_argument("--phase2-workers", type=int, default=4, help="Max hilos paralelos por modelo en fase 2.")
     ap.add_argument(
+        "--device",
+        default="",
+        help=(
+            "Override global de device para todas las fases (p. ej. cpu, cuda, cuda:0). "
+            "Si se omite, usa defaults.device del catálogo."
+        ),
+    )
+    ap.add_argument(
         "--skip-missing-videos",
         action="store_true",
         help="Ignora entradas de videos que no existen en disco (recomendado si el catalogo tiene placeholders).",
@@ -2435,6 +2443,11 @@ def main() -> None:
     campaign_dir = (output_root / campaign_name) if campaign_name else output_root
 
     catalog = load_catalog(catalog_path)
+    device_override = str(getattr(args, "device", "") or "").strip()
+    if device_override:
+        catalog.setdefault("defaults", {})
+        catalog["defaults"]["device"] = device_override
+        print(f"[catalog] override defaults.device={device_override!r}")
     if args.skip_missing_videos:
         vids = catalog.get("videos") or []
         kept = [v for v in vids if Path(str(v)).expanduser().exists()]
