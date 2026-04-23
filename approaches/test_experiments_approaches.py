@@ -79,6 +79,25 @@ class _TeeIO:
         return False
 
 
+def _setup_session_logging(
+    campaign_dir: Path,
+    no_session_log: bool,
+    orig_stdout: TextIO,
+) -> tuple[tuple[TextIO, threading.Lock] | None, TextIO | None, Path | None]:
+    if no_session_log:
+        print(f"[campaña] salida en: {campaign_dir}")
+        return None, None, None
+    log_dir = campaign_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    session_log_path = log_dir / ("orchestrator_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".log")
+    log_fp = open(session_log_path, "w", encoding="utf-8", buffering=1)
+    log_lock = threading.Lock()
+    sys.stdout = _TeeIO(orig_stdout, log_fp)
+    print(f"[orchestrator] log de sesión: {session_log_path.resolve()}")
+    print(f"[campaña] salida en: {campaign_dir}")
+    return (log_fp, log_lock), log_fp, session_log_path
+
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2452,19 +2471,26 @@ def main() -> None:
             )
             raise SystemExit(1)
         p4m = not args.no_psutil and psutil is not None
-        if (
-            _phase4_run_write(
-                catalog,
-                campaign_dir,
-                vpick,
-                pid4,
-                args,
-                p4m,
-                None,
-            )
-            is None
-        ):
-            raise SystemExit(1)
+        _orig_stdout = sys.stdout
+        session_log_tuple, _log_fp, _ = _setup_session_logging(campaign_dir, bool(args.no_session_log), _orig_stdout)
+        try:
+            if (
+                _phase4_run_write(
+                    catalog,
+                    campaign_dir,
+                    vpick,
+                    pid4,
+                    args,
+                    p4m,
+                    session_log_tuple,
+                )
+                is None
+            ):
+                raise SystemExit(1)
+        finally:
+            sys.stdout = _orig_stdout
+            if _log_fp is not None:
+                _log_fp.close()
         return
 
     if args.only_phase3 or args.only_phase34:
@@ -2516,35 +2542,42 @@ def main() -> None:
             )
             raise SystemExit(1)
         p3m = not args.no_psutil and psutil is not None
-        if not aid_list:
-            aid_list = [str(aid0)]
-        for aid in aid_list:
-            print(f"[phase3] --- {aid} perfil={pid0} ---", flush=True)
-            if _phase3_run_write(
-                catalog,
-                campaign_dir,
-                vpick,
-                str(aid),
-                str(pid0),
-                args,
-                p3m,
-                None,
-            ) is None:
-                raise SystemExit(1)
-        if args.only_phase34:
-            if not (args.phase4_approaches or "").strip():
-                args.phase4_approaches = ",".join(aid_list)
-            pid4 = (args.phase4_profile or "").strip() or str(pid0) or "stride_5"
-            if _phase4_run_write(
-                catalog,
-                campaign_dir,
-                vpick,
-                pid4,
-                args,
-                p3m,
-                None,
-            ) is None:
-                raise SystemExit(1)
+        _orig_stdout = sys.stdout
+        session_log_tuple, _log_fp, _ = _setup_session_logging(campaign_dir, bool(args.no_session_log), _orig_stdout)
+        try:
+            if not aid_list:
+                aid_list = [str(aid0)]
+            for aid in aid_list:
+                print(f"[phase3] --- {aid} perfil={pid0} ---", flush=True)
+                if _phase3_run_write(
+                    catalog,
+                    campaign_dir,
+                    vpick,
+                    str(aid),
+                    str(pid0),
+                    args,
+                    p3m,
+                    session_log_tuple,
+                ) is None:
+                    raise SystemExit(1)
+            if args.only_phase34:
+                if not (args.phase4_approaches or "").strip():
+                    args.phase4_approaches = ",".join(aid_list)
+                pid4 = (args.phase4_profile or "").strip() or str(pid0) or "stride_5"
+                if _phase4_run_write(
+                    catalog,
+                    campaign_dir,
+                    vpick,
+                    pid4,
+                    args,
+                    p3m,
+                    session_log_tuple,
+                ) is None:
+                    raise SystemExit(1)
+        finally:
+            sys.stdout = _orig_stdout
+            if _log_fp is not None:
+                _log_fp.close()
         return
 
     runs = expand_run_specs(catalog)
