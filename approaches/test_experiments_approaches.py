@@ -385,9 +385,11 @@ def run_single_experiment(
                     block = f"{prefix}[{tag}] {line}"
                     sys.stdout.write(block)
                     sys.stdout.flush()
-                    with log_lock:
-                        log_fp.write(block)
-                        log_fp.flush()
+                    # Si stdout ya está en tee (terminal + fichero), evitar doble volcado en log.
+                    if not isinstance(sys.stdout, _TeeIO):
+                        with log_lock:
+                            log_fp.write(block)
+                            log_fp.flush()
             finally:
                 pipe.close()
 
