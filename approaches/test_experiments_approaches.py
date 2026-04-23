@@ -1183,15 +1183,29 @@ def _stderr_all_runs(outs: list[dict[str, Any]]) -> str:
     return "\n".join(s).lower()
 
 
-def _phase3_post_batch_hygiene(pause_sec: float) -> None:
-    """Entre dosis: GC, vaciar caché CUDA en el orquestador (hijos ya terminaron) y pausa."""
+def _phase3_post_batch_hygiene(pause_sec: float, aggressive: bool = False) -> None:
+    """Entre dosis: GC, liberar caches host/GPU (best-effort) y pausa."""
     gc.collect()
+    if aggressive:
+        gc.collect()
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim(0)
+        except Exception:
+            pass
     try:
         import torch  # type: ignore[import-not-found]
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            if aggressive and hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            if aggressive and hasattr(torch.cuda, "reset_peak_memory_stats"):
+                torch.cuda.reset_peak_memory_stats()
     except Exception:
         pass
     if pause_sec > 0:
@@ -1317,6 +1331,7 @@ def run_phase3_parallel_sweep(
     max_parallel: int = 64,
     pause_sec: float = 2.0,
     min_free_ram_mib: int = 512,
+    aggressive_cleanup: bool = False,
     stream_log: tuple[TextIO, threading.Lock] | None = None,
     sweep_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -1394,7 +1409,7 @@ def run_phase3_parallel_sweep(
             last_fully_ok_n = N
         if set_stop and (oom or not all_ok):
             stop_sweep = "cuda_or_host_oom" if oom else on_fail
-        _phase3_post_batch_hygiene(pause_sec)
+        _phase3_post_batch_hygiene(pause_sec, aggressive=aggressive_cleanup)
 
     if sweep_mode == "fixed":
         for N in n_sorted:
@@ -1614,6 +1629,7 @@ def _phase3_run_write(
         max_parallel=int(getattr(args, "phase3_max_parallel", 64) or 64),
         pause_sec=float(args.phase3_pause_sec),
         min_free_ram_mib=int(args.phase3_min_free_ram_mib),
+        aggressive_cleanup=bool(getattr(args, "phase3_aggressive_cleanup", False)),
         stream_log=stream_log,
     )
     p3["phase3_orchestrator_wall_sec"] = round(time.perf_counter() - t0, 3)
@@ -1669,6 +1685,29 @@ def _metrics_path_n1_first_ok(sweep_inner: dict[str, Any]) -> Path | None:
     return None
 
 
+def _metrics_paths_for_n_ok_runs(sweep_inner: dict[str, Any], n_parallel: int) -> list[Path]:
+    """metrics.json de runs OK para un paso N concreto."""
+    out: list[Path] = []
+    for step in sweep_inner.get("steps") or []:
+        if step.get("skipped"):
+            continue
+        if int(step.get("n_parallel") or 0) != int(n_parallel):
+            continue
+        if not step.get("all_success"):
+            continue
+        for r in step.get("runs") or []:
+            if not r.get("success"):
+                continue
+            rd = r.get("run_dir")
+            if not rd:
+                continue
+            mp = Path(str(rd)) / "metrics.json"
+            if mp.is_file():
+                out.append(mp)
+        break
+    return out
+
+
 def _latency_and_pipeline_from_metrics(metrics_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Estadísticas vlm_calls + tiempos pipeline para contestar ~cuánto son 10s de vídeo."""
     try:
@@ -1679,6 +1718,43 @@ def _latency_and_pipeline_from_metrics(metrics_path: Path) -> tuple[dict[str, An
             {"error": str(e), "source_metrics_json": str(metrics_path)},
             {},
         )
+
+
+def _aggregate_latency_pipeline_from_metrics_paths(paths: list[Path]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Agrega latencias/pipeline de varios metrics.json (p. ej. runs de N máximo)."""
+    lat_rows: list[dict[str, Any]] = []
+    pipe_rows: list[dict[str, Any]] = []
+    for p in paths:
+        lat, pipe = _latency_and_pipeline_from_metrics(p)
+        if not lat.get("error"):
+            lat_rows.append(lat)
+        if not pipe.get("error"):
+            pipe_rows.append(pipe)
+    if not lat_rows and not pipe_rows:
+        return (
+            {"note": "Sin metrics.json válidos para agregar.", "runs_sampled": 0},
+            {"note": "Sin metrics.json válidos para agregar.", "runs_sampled": 0},
+        )
+    lat_med = _median_optional([x.get("median_sec") for x in lat_rows])
+    lat_mean = _mean_optional([x.get("mean_sec") for x in lat_rows])
+    lat_ms = (round(float(lat_med) * 1000.0, 3) if lat_med is not None else None)
+    pipe_wall_per_10s = _median_optional([x.get("derived_wall_clock_per_10s_video_sec") for x in pipe_rows])
+    pipe_wall = _median_optional([x.get("wall_clock_processing_sec") for x in pipe_rows])
+    return (
+        {
+            "runs_sampled": len(lat_rows),
+            "median_sec_per_vlm_call": round(float(lat_med), 6) if lat_med is not None else None,
+            "mean_sec_per_vlm_call": round(float(lat_mean), 6) if lat_mean is not None else None,
+            "median_ms_per_vlm_call": lat_ms,
+        },
+        {
+            "runs_sampled": len(pipe_rows),
+            "median_wall_clock_processing_sec": round(float(pipe_wall), 6) if pipe_wall is not None else None,
+            "median_wall_clock_per_10s_video_sec": (
+                round(float(pipe_wall_per_10s), 6) if pipe_wall_per_10s is not None else None
+            ),
+        },
+    )
     report = enrich_pipeline_report(raw)
     calls = report.get("vlm_calls") or []
     lat = [float(c["latency_sec"]) for c in calls if c.get("latency_sec") is not None]
@@ -1970,11 +2046,15 @@ def run_phase4_multi_model_sweep(
         n_steps = None
 
     approaches = catalog.get("approaches") or []
+    only_ids_raw = str(getattr(args, "phase4_approaches", "") or "").strip()
+    only_ids = {x.strip() for x in only_ids_raw.split(",") if x.strip()}
     models: list[dict[str, Any]] = []
 
     for ap_entry in approaches:
         aid = str(ap_entry.get("id") or "").strip()
         if not aid:
+            continue
+        if only_ids and aid not in only_ids:
             continue
         script_n = str(ap_entry.get("script") or "")
         sweep_sub = campaign_dir / "phase4_parallel_sweep" / _sanitize_id(aid)
@@ -2000,6 +2080,7 @@ def run_phase4_multi_model_sweep(
                 max_parallel=int(getattr(args, "phase3_max_parallel", 64) or 64),
                 pause_sec=float(args.phase3_pause_sec),
                 min_free_ram_mib=int(args.phase3_min_free_ram_mib),
+                aggressive_cleanup=bool(getattr(args, "phase3_aggressive_cleanup", False)),
                 stream_log=stream_log,
                 sweep_dir=sweep_sub,
             )
@@ -2022,6 +2103,11 @@ def run_phase4_multi_model_sweep(
 
             n_ok = int(p_inner.get("last_fully_successful_n_parallel") or 0)
             entry["last_fully_successful_n_parallel"] = n_ok
+            if n_ok > 0:
+                mpaths_nmax = _metrics_paths_for_n_ok_runs(p_inner, n_ok)
+                lat_nmax, pipe_nmax = _aggregate_latency_pipeline_from_metrics_paths(mpaths_nmax)
+                entry["latency_vlm_calls_at_n_max"] = lat_nmax
+                entry["pipeline_at_n_max"] = pipe_nmax
             entry["sweep_ended_because"] = p_inner.get("sweep_ended_because")
             entry["n_steps_tried"] = p_inner.get("n_steps_tried")
             entry["parallel_sweep_detail_json"] = str(frag.resolve())
@@ -2042,15 +2128,10 @@ def run_phase4_multi_model_sweep(
                 }
             )
 
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        time.sleep(max(0.0, float(getattr(args, "phase3_pause_sec", 2.0))))
+        _phase3_post_batch_hygiene(
+            max(0.0, float(getattr(args, "phase3_pause_sec", 2.0))),
+            aggressive=bool(getattr(args, "phase3_aggressive_cleanup", False)),
+        )
 
     models.sort(
         key=lambda m: int(m.get("last_fully_successful_n_parallel") or 0),
@@ -2249,6 +2330,14 @@ def main() -> None:
     )
     ap.add_argument("--phase3-pause-sec", type=float, default=2.0, help="Pausa entre dosis (liberar carga suave).")
     ap.add_argument(
+        "--phase3-aggressive-cleanup",
+        action="store_true",
+        help=(
+            "Limpieza reforzada entre lotes/enfoques: gc extra + malloc_trim + CUDA empty_cache/ipc_collect "
+            "(best-effort; no equivale a reiniciar el sistema)."
+        ),
+    )
+    ap.add_argument(
         "--phase3-min-free-ram-mib",
         type=int,
         default=512,
@@ -2275,6 +2364,14 @@ def main() -> None:
         type=Path,
         default=None,
         help="Mp4 para fase 4; si vacío se usa --phase3-video o el vídeo de screening del catálogo.",
+    )
+    ap.add_argument(
+        "--phase4-approaches",
+        default="siglip_v2,siglip,clip,mobileclip",
+        help=(
+            "IDs de approach para fase 4 separados por coma. "
+            "Por defecto limita a siglip_v2,siglip,clip,mobileclip."
+        ),
     )
     args = ap.parse_args()
 

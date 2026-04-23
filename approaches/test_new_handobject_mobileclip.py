@@ -29,6 +29,7 @@ class DifferentialOpenClipLikeClassifier(OpenClipLikeClassifier):
         backend_name: str,
         net_th: float = 0.35,
         net_margin_th: float = 0.30,
+        decision_mode: str = "weighted",
         multicrop_mode: str = "batch3",
         torso_weight: float = 0.45,
         left_weight: float = 0.275,
@@ -43,6 +44,7 @@ class DifferentialOpenClipLikeClassifier(OpenClipLikeClassifier):
         ]
         self.net_th = float(max(0.0, net_th))
         self.net_margin_th = float(max(0.0, net_margin_th))
+        self.decision_mode = str(decision_mode)
         self.multicrop_mode = str(multicrop_mode)
         wsum = max(1e-6, float(torso_weight + left_weight + right_weight))
         self.crop_weights = [float(torso_weight / wsum), float(left_weight / wsum), float(right_weight / wsum)]
@@ -111,11 +113,20 @@ class DifferentialOpenClipLikeClassifier(OpenClipLikeClassifier):
         p_obj_global = float(np.sum(w * p_obj))
         p_other_global = float(np.sum(w * p_other))
         margin_ok = (net_global > self.net_margin_th) and (p_obj_global > (p_other_global + 0.05))
-        gated_yes = p_obj_global if (margin_ok and net_global > self.net_th) else 0.0
+        if self.decision_mode == "majority":
+            positives = ((net > self.net_th) & (net > self.net_margin_th) & (p_obj > (p_other + 0.05))).astype(np.int32)
+            votes_yes = int(np.sum(positives))
+            votes_needed = (len(crops) // 2) + 1
+            gated_yes = p_obj_global if votes_yes >= votes_needed else 0.0
+        else:
+            votes_yes = 0
+            votes_needed = 0
+            gated_yes = p_obj_global if (margin_ok and net_global > self.net_th) else 0.0
         self.last_answer_text = "YES" if gated_yes > 0.0 else "NO"
         self.last_debug = (
             f"p_obj={p_obj_global:.3f} net={net_global:.3f} net_th={self.net_th:.3f} "
-            f"net_margin={self.net_margin_th:.3f} p_other={p_other_global:.3f} multi={self.multicrop_mode}"
+            f"net_margin={self.net_margin_th:.3f} p_other={p_other_global:.3f} multi={self.multicrop_mode} "
+            f"decision={self.decision_mode} votes={votes_yes}/{votes_needed}"
         )
         if frame_index is not None and vlm_calls is not None:
             vlm_calls.append(
@@ -147,6 +158,12 @@ def main() -> None:
         choices=["off", "light", "full", "batch3"],
         help="Modo multi-crop; batch3 recomendado.",
     )
+    p.add_argument(
+        "--decision-mode",
+        default="weighted",
+        choices=["weighted", "majority"],
+        help="weighted: score ponderado; majority: voto por mayoría entre crops.",
+    )
     args = parse_args(p)
     args.crop_mode = "upper-torso-hands"
     args.per_hand_fast = True
@@ -159,6 +176,7 @@ def main() -> None:
         backend_name="mobileclip",
         net_th=float(args.net_th),
         net_margin_th=float(args.net_margin_th),
+        decision_mode=str(args.decision_mode),
         multicrop_mode=str(args.multicrop_mode),
     )
     run_pipeline(

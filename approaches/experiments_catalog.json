@@ -27,6 +27,7 @@
   ],
   "approaches": [
     {"id": "clip", "script": "test_new_handobject_clip.py"},
+    {"id": "siglip_v2", "script": "test_new_handobject_siglip_v2.py"},
     {"id": "siglip", "script": "test_new_handobject_siglip.py"},
     {"id": "mobileclip", "script": "test_new_handobject_mobileclip.py"},
     {"id": "openvision", "script": "test_new_handobject_openvision.py"},

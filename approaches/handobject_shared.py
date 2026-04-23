@@ -1299,9 +1299,12 @@ def run_pipeline(
                             side_probs[primary_side] = p_prob
                             tr.hands[primary_side].last_crop_box = primary_box if primary_crop.size > 0 else None
                             answer_txt = getattr(classifier, "last_answer_text", "")
+                            dbg_txt = getattr(classifier, "last_debug", "")
                             print(
                                 f"[f={frame_i} id={tid} side={primary_side}] MODELO: {answer_txt} | yes_prob={p_prob:.3f}"
                             )
+                            if dbg_txt:
+                                print(f"[f={frame_i} id={tid} side={primary_side}] DEBUG: {dbg_txt}")
                             # Si hay segunda mano activa y la principal esta en zona gris, evaluarla tambien.
                             need_second = abs(p_prob - 0.5) <= float(args.fast_gray_zone)
                             other_sides = [s for s in det_active_sides if s != primary_side]
@@ -1326,9 +1329,12 @@ def run_pipeline(
                                 side_probs[secondary_side] = s_prob
                                 tr.hands[secondary_side].last_crop_box = sec_box if sec_crop.size > 0 else None
                                 answer_txt2 = getattr(classifier, "last_answer_text", "")
+                                dbg_txt2 = getattr(classifier, "last_debug", "")
                                 print(
                                     f"[f={frame_i} id={tid} side={secondary_side}] MODELO: {answer_txt2} | yes_prob={s_prob:.3f}"
                                 )
+                                if dbg_txt2:
+                                    print(f"[f={frame_i} id={tid} side={secondary_side}] DEBUG: {dbg_txt2}")
                             # Lados no evaluados este ciclo: usar su propio historial suavizado degradado.
                             for s in det_active_sides:
                                 if s not in side_probs:
@@ -1384,11 +1390,6 @@ def run_pipeline(
                                 acc_on_th=float(getattr(args, "acc_on_th", 1.0)),
                                 acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
                             )
-                            hs_side = tr.hands[side]
-                            print(
-                                f"[f={frame_i} id={tid} side={side}] RESPUESTA: "
-                                f"{'YES' if hs_side.holding else 'NO'} | yes_prob={p_side:.3f}"
-                            )
                         any_hold_now = any(tr.hands[s].holding for s in det_active_sides)
                         if any_hold_now:
                             # Guardar trayectoria solo cuando el estado "holding" está confirmado.
@@ -1429,6 +1430,11 @@ def run_pipeline(
                             acc_off_th=float(getattr(args, "acc_off_th", 0.35)),
                         )
                     curr_track_hold = tr.hands["left"].holding or tr.hands["right"].holding
+                    print(
+                        f"[f={frame_i} id={tid}] RESPUESTA_GLOBAL: "
+                        f"{'YES' if curr_track_hold else 'NO'} | "
+                        f"L={tr.hands['left'].raw_prob:.3f} R={tr.hands['right'].raw_prob:.3f}"
+                    )
                     # Abrir ventana de refinado tras transición YES->NO o hold->no-hold.
                     if prev_track_hold and (not curr_track_hold):
                         # Mostrar resultado inmediato para no perder el texto en casos límite.
