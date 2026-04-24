@@ -1,0 +1,9 @@
+tracker_type: bytetrack
+# Nota: la resolucion YOLO se define en el script/CLI con --imgsz (default actual: 640),
+# no en este YAML del tracker.
+track_high_thresh: 0.3
+track_low_thresh: 0.05
+new_track_thresh: 0.25
+track_buffer: 9000
+match_thresh: 0.92
+fuse_score: true
