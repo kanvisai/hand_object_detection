@@ -62,7 +62,7 @@ python tracking_id/run_norfair.py --video /ruta/video.mp4 --show --save-video
 
 - `--output /ruta/salida.mp4` salida de video.
 - `--output-fps 25` fps del video guardado (0 = fps original).
-- `--max-absence-sec 900` intentar mantener/reasignar ID hasta 15 min de ausencia (ya viene por defecto).
+- `--max-absence-sec 1.0` (por defecto) ventana corta: si no se ve a la persona ~1s, no se reutiliza el ID al reaparecer otro. Para re-ID larga usa valores mayores (p.ej. `900`).
 - `--similarity-threshold 0.76` umbral de matching de identidad (default mas tolerante para reducir saltos de ID).
 - `--yolo-model yolo11n.pt` modelo YOLO.
 - `--device auto` (default, usa CUDA si existe; si no, CPU). Tambien puedes forzar `--device cpu`.

@@ -473,8 +473,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-absence-sec",
         type=float,
-        default=900.0,
-        help="Segundos maximos de ausencia para intentar conservar/reasignar el mismo ID (default recomendado: 900s).",
+        default=1.0,
+        help=(
+            "Segundos maximos de ausencia para intentar conservar/reasignar el mismo ID canónico. "
+            "Por defecto 1s: si la persona deja de verse, suele asignarse un ID nuevo al volver "
+            "(p.ej. a 12 fps ≈ 12 frames). Para re-ID larga (mismo corridor), sube este valor."
+        ),
     )
     parser.add_argument("--similarity-threshold", type=float, default=0.76)
     parser.add_argument("--botsort-with-reid", action="store_true")
