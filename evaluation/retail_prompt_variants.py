@@ -47,6 +47,16 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands inside a shopping cart or store trolley.",
         _BAG,
     ],
+    # Refinamiento de frames_v2_probe: más contraste entre "objeto en mano" y contenedores.
+    "frames_v2_probe_v2_fine": [
+        "A shopper clearly holding a product, package, bottle, or boxed item in hand.",
+        "Both hands visibly empty, not holding any item.",
+        "Hands in pockets or not visible, with no visible item in hand.",
+        "Hands touching clothes or making neutral gestures, with no item in hand.",
+        "Hands clearly inside a visible shopping basket, interacting with items in the basket.",
+        "Hands clearly inside a visible shopping cart/trolley, interacting with items in the cart.",
+        "Hands putting or hiding an item into a personal handbag, backpack, tote, or personal plastic bag.",
+    ],
     # Solo cambia la etiqueta "manos vacías" (experimento tipo usuario).
     "empty_hands_minimal": [
         RETAIL_PROMPT_TEXTS_EN[0],
