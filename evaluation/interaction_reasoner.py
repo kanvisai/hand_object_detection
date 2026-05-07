@@ -376,9 +376,7 @@ def reason_interaction(
     run_basket = _max_run_length(labels_smooth, "shopping_basket")
     run_cart = _max_run_length(labels_smooth, "shopping_cart")
     run_bag = _max_run_length(labels_smooth, "personal_bag_deposit")
-    # Política actual: "personal_bag_deposit" no participa en veredicto de depósito
-    # para evitar falsos positivos sensibles.
-    run_deposit = max(run_basket, run_cart)
+    run_deposit = max(run_basket, run_cart, run_bag)
 
     evidence: dict[str, Any] = {
         "frames_total": len(ordered),

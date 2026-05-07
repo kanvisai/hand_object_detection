@@ -19,9 +19,7 @@ _EXPECTED = len(CANONICAL_LABELS)
 
 _BASKET = RETAIL_PROMPT_TEXTS_EN[4]
 _CART = RETAIL_PROMPT_TEXTS_EN[5]
-# Política actual: evitar falsos positivos de "guardar en bolso personal".
-# Dejamos el slot 6 como clase negativa/neutral para mantener compatibilidad de 7 clases.
-_BAG_DISABLED = "No clear evidence of storing an item in a personal bag in this frame."
+_BAG = RETAIL_PROMPT_TEXTS_EN[6]
 
 
 def _validate(variant_id: str, texts: list[str]) -> None:
@@ -47,7 +45,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands gesturing or touching clothing with no product, bottle or box in hand.",
         "Hands inside a shopping basket among food or products.",
         "Hands inside a shopping cart or store trolley.",
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Refinamiento de frames_v2_probe: más contraste entre "objeto en mano" y contenedores.
     "frames_v2_probe_v2_fine": [
@@ -77,7 +75,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "A person clapping or rubbing their hands together.",
         _BASKET,
         _CART,
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Igual que arriba pero sin "stolen" (más adecuado a tienda).
     "v2_person_four_retail_product": [
@@ -87,7 +85,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "A person clapping or rubbing their hands together.",
         _BASKET,
         _CART,
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Frases más cortas en slots persona + mismos contenedores.
     "compact_person_slots": [
@@ -97,7 +95,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands touching clothes or gesturing, no product in hand.",
         _BASKET,
         _CART,
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Variante "anti-falsos positivos": fuerza negativos ambiguos en slots no-objeto.
     # No añade una clase 8; mantiene 7 clases para no romper mapping.
@@ -118,7 +116,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands visible but interaction is unclear or non-object-related.",
         _BASKET,
         _CART,
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Etapa A: estado de manos (evita que cesta/carro secuestren la clasificación).
     # Mantiene 7 slots por compatibilidad, pero basket/cart/bag son hard-negatives explícitos.
@@ -139,7 +137,7 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands near body or shelves, but not clearly depositing into a container.",
         "Hands placing or dropping an item into a shopping basket, with basket clearly visible.",
         "Hands placing or dropping an item into a shopping cart/trolley, with cart clearly visible.",
-        _BAG_DISABLED,
+        _BAG,
     ],
     # Etapa A v2 (más minimalista): objetivo principal = objeto en mano / no objeto / no claro.
     # Se mantiene formato de 7 slots por compatibilidad con CANONICAL_LABELS.
