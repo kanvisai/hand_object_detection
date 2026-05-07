@@ -108,6 +108,27 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         _CART,
         _BAG,
     ],
+    # Etapa A: estado de manos (evita que cesta/carro secuestren la clasificación).
+    # Mantiene 7 slots por compatibilidad, pero basket/cart/bag son hard-negatives explícitos.
+    "hand_state_only_v1": [
+        "Hands clearly holding an item or product.",
+        "Hands clearly empty, no item in either hand.",
+        "Hands hidden in pockets, behind body, or not visible.",
+        "Hands visible but not manipulating any item (neutral gesture or resting posture).",
+        "No visible shopping basket interaction in this frame.",
+        "No visible shopping cart interaction in this frame.",
+        "No visible personal bag storing action in this frame.",
+    ],
+    # Etapa B: contexto de contenedor/depósito (para correr en segunda pasada).
+    "container_context_v1": [
+        "Hands holding an item, not depositing it into a container.",
+        "Hands empty, no container interaction.",
+        "Hands hidden or uncertain, no clear container interaction.",
+        "Hands near body or shelves, but not clearly depositing into a container.",
+        "Hands placing or dropping an item into a shopping basket, with basket clearly visible.",
+        "Hands placing or dropping an item into a shopping cart/trolley, with cart clearly visible.",
+        "Hands placing or hiding an item inside a personal bag, handbag, backpack, tote, or personal plastic bag.",
+    ],
 }
 
 for _vid, _txts in PROMPT_VARIANTS.items():
