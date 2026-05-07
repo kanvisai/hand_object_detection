@@ -129,6 +129,17 @@ PROMPT_VARIANTS: dict[str, list[str]] = {
         "Hands placing or dropping an item into a shopping cart/trolley, with cart clearly visible.",
         "Hands placing or hiding an item inside a personal bag, handbag, backpack, tote, or personal plastic bag.",
     ],
+    # Etapa A v2 (más minimalista): objetivo principal = objeto en mano / no objeto / no claro.
+    # Se mantiene formato de 7 slots por compatibilidad con CANONICAL_LABELS.
+    "hand_state_only_v2": [
+        "A person clearly holding any item in at least one hand.",
+        "A person with both hands clearly empty, holding nothing.",
+        "Hands not visible, partially occluded, or hidden in pockets.",
+        "Hands visible but action ambiguous, with no clear evidence of holding an item.",
+        "No clear evidence of basket interaction in this frame.",
+        "No clear evidence of shopping cart interaction in this frame.",
+        "No clear evidence of personal bag storing action in this frame.",
+    ],
 }
 
 for _vid, _txts in PROMPT_VARIANTS.items():
