@@ -15,7 +15,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 """Mano-objeto + SigLIP (embeddings positivo/negativo)."""
 
 from handobject_classifiers import ClipLikeClassifier
-from handobject_shared import build_parser, parse_args, run_pipeline
+from handobject_shared import (
+    build_hand_crop,
+    build_parser,
+    extract_people_and_hands,
+    parse_args,
+    resolve_yolo_weights_for_runtime,
+    run_pipeline,
+    yolo_predict_device_for_args,
+)
+from ultralytics import YOLO
 
 _SESSION_VLM_NULLS: dict[str, Any] = {
     "vlm_vector_prompt_probs": None,
@@ -65,6 +74,15 @@ _PROMPT_PROFILES: dict[str, list[str]] = {
         "Hands inside a shopping basket among food or products.",
         "Hands inside a shopping cart or store trolley.",
     ],
+    # Cesta/carro solo si se ve claramente el contenedor (reduce FPs en estanterías).
+    "strict_container_visible": [
+        "Hands clearly holding a product, package, box, or bottle.",
+        "Hands empty with no item held.",
+        "Hands hidden in pockets or not visible.",
+        "Hands touching clothes or gesturing, no item in hand.",
+        "Hands inside a clearly visible portable shopping basket with basket rim or handle visible.",
+        "Hands inside a clearly visible shopping cart with cart frame or handle visible.",
+    ],
 }
 
 
@@ -98,6 +116,8 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
             )
         self.prompt_profile = profile_key
         self.texts = list(_PROMPT_PROFILES[profile_key])
+        # Calibración rápida anti-FP: en perfil estricto pedimos más evidencia para cesta/carro.
+        self.container_logit_penalty = 3.0 if profile_key == "strict_container_visible" else 0.0
         self._prompt_idx_basket = 4
         self._prompt_idx_cart = 5
         self.net_th = float(max(0.0, net_th))
@@ -174,6 +194,10 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
             t0 = time.perf_counter()
             img_feat = self._l2_normalize(self._encode_image(inp))
             logits_t = 100.0 * img_feat @ self.text_features.T
+            if self.container_logit_penalty > 0.0:
+                logits_t = logits_t.clone()
+                logits_t[:, self._prompt_idx_basket] -= float(self.container_logit_penalty)
+                logits_t[:, self._prompt_idx_cart] -= float(self.container_logit_penalty)
             probs_t = torch.softmax(logits_t, dim=1)
             latency = time.perf_counter() - t0
         w = np.array(weights, dtype=np.float32)
@@ -513,6 +537,8 @@ def run_single_image_probe(
     clf: SiglipSO400MClassifier,
     image_path: Path,
     *,
+    args: Any,
+    yolo_pose_model: Any | None,
     image_roi: tuple[int, int, int, int] | None,
     dump_crops_dir: Path | None,
     output_json: Path | None,
@@ -524,6 +550,54 @@ def run_single_image_probe(
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None or bgr.size == 0:
         raise RuntimeError(f"No se pudo leer la imagen: {path}")
+    yolo_applied = False
+    yolo_crop_box_xyxy: tuple[int, int, int, int] | None = None
+    if yolo_pose_model is not None:
+        detections = extract_people_and_hands(
+            bgr,
+            yolo_pose_model,
+            float(getattr(args, "wrist_conf_th", 0.15)),
+            float(getattr(args, "elbow_conf_th", 0.10)),
+            predict_device=yolo_predict_device_for_args(args),
+        )
+        if detections:
+            # Preferimos la persona con mayor área (escenario típico: una sola persona).
+            det = max(
+                detections,
+                key=lambda d: max(
+                    1,
+                    (int(d["person_box"][2]) - int(d["person_box"][0]))
+                    * (int(d["person_box"][3]) - int(d["person_box"][1])),
+                ),
+            )
+            hand_boxes: list[tuple[int, int, int, int]] = []
+            for side in ("left", "right"):
+                hd = (det.get("hands") or {}).get(side)
+                if not hd:
+                    continue
+                crop_img, crop_box = build_hand_crop(
+                    bgr,
+                    tuple(det["person_box"]),
+                    tuple(hd["wrist"]),
+                    tuple(hd["elbow"]) if hd.get("elbow") is not None else None,
+                    int(getattr(args, "crop_size", 220)),
+                    int(getattr(args, "crop_min", 180)),
+                    int(getattr(args, "crop_max", 420)),
+                    crop_mode="upper-torso-hands",
+                )
+                if crop_img is not None and crop_img.size > 0:
+                    hand_boxes.append(crop_box)
+            if hand_boxes:
+                x1 = min(b[0] for b in hand_boxes)
+                y1 = min(b[1] for b in hand_boxes)
+                x2 = max(b[2] for b in hand_boxes)
+                y2 = max(b[3] for b in hand_boxes)
+                yolo_crop_box_xyxy = (int(x1), int(y1), int(x2), int(y2))
+            else:
+                yolo_crop_box_xyxy = tuple(det["person_box"])
+            x1, y1, x2, y2 = yolo_crop_box_xyxy
+            bgr = bgr[y1:y2, x1:x2]
+            yolo_applied = True
     if image_roi is not None:
         x1, y1, x2, y2 = image_roi
         h, w = bgr.shape[:2]
@@ -559,6 +633,8 @@ def run_single_image_probe(
     report: dict[str, Any] = {
         "image_path": str(path),
         "image_roi_xyxy": list(image_roi) if image_roi is not None else None,
+        "image_yolo_crop_applied": bool(yolo_applied),
+        "image_yolo_crop_xyxy": list(yolo_crop_box_xyxy) if yolo_crop_box_xyxy is not None else None,
         "probe_input_shape_hwc": [int(bgr.shape[0]), int(bgr.shape[1]), int(bgr.shape[2])],
         "vlm_model": clf.model_name,
         "device": str(clf.device),
@@ -662,6 +738,11 @@ def main() -> None:
         help="Opcional con --image: guarda el informe en este .json.",
     )
     p.add_argument(
+        "--image-use-yolo",
+        action="store_true",
+        help="Solo con --image: aplica YOLO Pose y recorta automáticamente región torso+manos antes del multicrop.",
+    )
+    p.add_argument(
         "--image-roi",
         default="",
         help="Solo con --image: ROI manual x1,y1,x2,y2 (pixel) para recortar antes del multicrop.",
@@ -710,7 +791,17 @@ def main() -> None:
         img_json = str(getattr(args, "image_output_json", "") or "").strip()
         roi_s = str(getattr(args, "image_roi", "") or "").strip()
         dump_s = str(getattr(args, "dump_crops_dir", "") or "").strip()
+        use_yolo_for_image = bool(getattr(args, "image_use_yolo", False))
         roi_xyxy: tuple[int, int, int, int] | None = None
+        pose_model = None
+        if use_yolo_for_image and roi_s:
+            raise RuntimeError("Usa solo uno: --image-use-yolo o --image-roi (no ambos).")
+        if use_yolo_for_image:
+            args.pose_weights = resolve_yolo_weights_for_runtime(str(args.pose_weights), allow_tensorrt=False)
+            print(f"[probe] Cargando YOLO pose: {args.pose_weights}", flush=True)
+            pose_model = YOLO(str(args.pose_weights), task="pose")
+            if args.device and not str(args.pose_weights).lower().endswith(".engine"):
+                pose_model.to(args.device)
         if roi_s:
             toks = [t.strip() for t in roi_s.split(",")]
             if len(toks) != 4:
@@ -725,6 +816,8 @@ def main() -> None:
         run_single_image_probe(
             clf,
             Path(image_s),
+            args=args,
+            yolo_pose_model=pose_model,
             image_roi=roi_xyxy,
             dump_crops_dir=Path(dump_s).expanduser().resolve() if dump_s else None,
             output_json=Path(img_json).expanduser().resolve() if img_json else None,

@@ -33,6 +33,8 @@ def _validate(variant_id: str, texts: list[str]) -> None:
 PROMPT_VARIANTS: dict[str, list[str]] = {
     # Producción / línea base actual (retail_semantic_prompts).
     "default": list(RETAIL_PROMPT_TEXTS_EN),
+    # Lista recomendada para retail (escenario tienda) con foco en mano vacía/objeto/depósito.
+    "retail_store_core_v1": list(RETAIL_PROMPT_TEXTS_EN),
     # Igual que `default` (nombre explícito por si migráis la línea base).
     "retail_current": list(RETAIL_PROMPT_TEXTS_EN),
     # Misma línea base que test_new_handobject_siglip_v2_frames (6 primeros) + bolso como en retail.
