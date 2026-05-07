@@ -33,13 +33,14 @@ def _sorted_frames(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(frames, key=key)
 
 
-def _extract_probs(fr: dict[str, Any]) -> tuple[float, float] | None:
+def _extract_probs(fr: dict[str, Any], *, obj_idx: int, empty_idx: int) -> tuple[float, float] | None:
     probs = fr.get("vlm_vector_prompt_probs")
-    if not isinstance(probs, list) or len(probs) < 2:
+    need = max(obj_idx, empty_idx) + 1
+    if not isinstance(probs, list) or len(probs) < need:
         return None
     try:
-        p_obj = float(probs[0])
-        p_empty = float(probs[1])
+        p_obj = float(probs[obj_idx])
+        p_empty = float(probs[empty_idx])
     except (TypeError, ValueError):
         return None
     return p_obj, p_empty
@@ -106,6 +107,8 @@ def main() -> None:
     p.add_argument("--net-off", type=float, default=0.05, help="(p_obj - p_empty) para mantener object.")
     p.add_argument("--margin", type=float, default=0.10, help="Margen mínimo entre p_obj y p_empty.")
     p.add_argument("--empty-on", type=float, default=0.55, help="Umbral para marcar empty.")
+    p.add_argument("--obj-idx", type=int, default=0, help="Índice del prompt 'objeto en mano' en vlm_vector_prompt_probs.")
+    p.add_argument("--empty-idx", type=int, default=1, help="Índice del prompt 'manos vacías' en vlm_vector_prompt_probs.")
     args = p.parse_args()
 
     payloads = [_load_payload(Path(x).expanduser().resolve()) for x in args.input_json]
@@ -124,12 +127,16 @@ def main() -> None:
             "sample_idx": fr.get("sample_idx"),
             "image_key": fr.get("image_key"),
         }
-        if not fr.get("evaluable"):
+        # Compatibilidad:
+        # - session_semantics.py usa "evaluable"
+        # - test_new_handobject_siglip_v2_frames.py (session vectors) usa "vlm_applied"
+        is_evaluable = bool(fr.get("evaluable")) if ("evaluable" in fr) else bool(fr.get("vlm_applied"))
+        if not is_evaluable:
             row = {**base, "state": "uncertain", "reason": "not_evaluable", "p_obj": None, "p_empty": None}
             seq.append(row)
             prev_state = "uncertain"
             continue
-        pp = _extract_probs(fr)
+        pp = _extract_probs(fr, obj_idx=int(args.obj_idx), empty_idx=int(args.empty_idx))
         if pp is None:
             row = {**base, "state": "uncertain", "reason": "missing_probs", "p_obj": None, "p_empty": None}
             seq.append(row)
