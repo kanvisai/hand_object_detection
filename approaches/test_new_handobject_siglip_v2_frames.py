@@ -38,6 +38,35 @@ _LABELS_ES_PROBE: list[str] = [
     "manos dentro del carro",
 ]
 
+_PROMPT_PROFILES: dict[str, list[str]] = {
+    "default": [
+        "A shopper holding a packaged grocery item or product box with their hands in a store aisle.",
+        "Empty hands with palms open, not grasping any package, bottle or box.",
+        "Hands in pockets or fully hidden, not visible holding anything.",
+        "Hands gesturing or touching clothing with no product, bottle or box in hand.",
+        "Hands inside a shopping basket among food or products.",
+        "Hands inside a shopping cart or store trolley.",
+    ],
+    # Más estricto en negativos ambiguos para recortar falsos positivos.
+    "hard_negative": [
+        "Hands clearly holding a product, package, bottle, or boxed item.",
+        "Empty hands, no object held at all.",
+        "Hands not visible or hidden in pockets; no clear object in hands.",
+        "Ambiguous hand motion or touching clothes, with no clear evidence of holding a product.",
+        "Hands reaching into or inside a shopping basket.",
+        "Hands reaching into or inside a shopping cart or trolley.",
+    ],
+    # Variante con lenguaje tipo unknown en clases negativas.
+    "unknown_like": [
+        "A shopper clearly carrying an item in hand (package, box, bottle, or product).",
+        "No object in hands; hands are empty.",
+        "Hands hidden or out of view, action uncertain.",
+        "Hands visible but interaction is unclear or non-object-related.",
+        "Hands inside a shopping basket among food or products.",
+        "Hands inside a shopping cart or store trolley.",
+    ],
+}
+
 
 class SiglipSO400MClassifier(ClipLikeClassifier):
     """SigLIP SO400M con batch multiescala y score diferencial."""
@@ -48,6 +77,7 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
         device: str,
         prompt: str,
         *,
+        prompt_profile: str = "default",
         net_th: float = 0.35,
         net_margin_th: float = 0.30,
         decision_mode: str = "weighted",
@@ -60,14 +90,14 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
         # Softmax de 6 anclas (orden fijo). Inglés para SigLIP; ver siglip_prompt_labels_es en JSON.
         # [0] Enfoque tienda / producto empaquetado: "visible object" era demasiado genérico y perdía
         #     frente a otras clases en recortes de cámara cenital.
-        self.texts = [
-            "A shopper holding a packaged grocery item or product box with their hands in a store aisle.",
-            "Empty hands with palms open, not grasping any package, bottle or box.",
-            "Hands in pockets or fully hidden, not visible holding anything.",
-            "Hands gesturing or touching clothing with no product, bottle or box in hand.",
-            "Hands inside a shopping basket among food or products.",
-            "Hands inside a shopping cart or store trolley.",
-        ]
+        profile_key = str(prompt_profile).strip().lower()
+        if profile_key not in _PROMPT_PROFILES:
+            raise RuntimeError(
+                f"Perfil de prompts no válido: {prompt_profile!r}. "
+                f"Opciones: {', '.join(sorted(_PROMPT_PROFILES.keys()))}"
+            )
+        self.prompt_profile = profile_key
+        self.texts = list(_PROMPT_PROFILES[profile_key])
         self._prompt_idx_basket = 4
         self._prompt_idx_cart = 5
         self.net_th = float(max(0.0, net_th))
@@ -155,16 +185,31 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
         logits_np = logits_t.detach().cpu().numpy()
         probs_np = probs_t.detach().cpu().numpy()
         img_np = img_feat.detach().cpu().numpy()
-        fused_logits = np.sum(w[:, None] * logits_np, axis=0)
-        fused_probs = np.sum(w[:, None] * probs_np, axis=0)
-        fused_probs = fused_probs / max(1e-9, float(np.sum(fused_probs)))
-        fused_emb = np.sum(w[:, None] * img_np, axis=0)
-        fused_emb = fused_emb / max(1e-9, float(np.linalg.norm(fused_emb)))
         net = p_obj - p_empty
-        net_global = float(np.sum(w * net))
-        p_obj_global = float(np.sum(w * p_obj))
-        p_other_global = float(np.sum(w * p_other_max))
-        margin_ok = (net_global > self.net_margin_th) and (p_obj_global > (p_other_global + 0.05))
+        best_crop_idx = int(np.argmax(net)) if net.size > 0 else 0
+        if self.decision_mode == "best_crop":
+            fused_logits = np.asarray(logits_np[best_crop_idx], dtype=np.float64)
+            fused_probs = np.asarray(probs_np[best_crop_idx], dtype=np.float64)
+            fused_probs = fused_probs / max(1e-9, float(np.sum(fused_probs)))
+            fused_emb = np.asarray(img_np[best_crop_idx], dtype=np.float64)
+            fused_emb = fused_emb / max(1e-9, float(np.linalg.norm(fused_emb)))
+            net_global = float(net[best_crop_idx])
+            p_obj_global = float(p_obj[best_crop_idx])
+            p_other_global = float(p_other_max[best_crop_idx])
+            votes_yes = 0
+            votes_needed = 0
+            margin_ok = (net_global > self.net_margin_th) and (p_obj_global > (p_other_global + 0.05))
+            gated_yes = p_obj_global if (margin_ok and net_global > self.net_th) else 0.0
+        else:
+            fused_logits = np.sum(w[:, None] * logits_np, axis=0)
+            fused_probs = np.sum(w[:, None] * probs_np, axis=0)
+            fused_probs = fused_probs / max(1e-9, float(np.sum(fused_probs)))
+            fused_emb = np.sum(w[:, None] * img_np, axis=0)
+            fused_emb = fused_emb / max(1e-9, float(np.linalg.norm(fused_emb)))
+            net_global = float(np.sum(w * net))
+            p_obj_global = float(np.sum(w * p_obj))
+            p_other_global = float(np.sum(w * p_other_max))
+            margin_ok = (net_global > self.net_margin_th) and (p_obj_global > (p_other_global + 0.05))
         if self.decision_mode == "majority":
             positives = ((net > self.net_th) & (net > self.net_margin_th) & (p_obj > (p_other_max + 0.05))).astype(
                 np.int32
@@ -172,7 +217,7 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
             votes_yes = int(np.sum(positives))
             votes_needed = (len(crops) // 2) + 1
             gated_yes = p_obj_global if votes_yes >= votes_needed else 0.0
-        else:
+        elif self.decision_mode != "best_crop":
             votes_yes = 0
             votes_needed = 0
             gated_yes = p_obj_global if (margin_ok and net_global > self.net_th) else 0.0
@@ -189,6 +234,7 @@ class SiglipSO400MClassifier(ClipLikeClassifier):
             "p_other_global": p_other_global,
             "votes_yes": votes_yes,
             "votes_needed": votes_needed,
+            "best_crop_idx": best_crop_idx,
             "hands_in_shopping_basket_prob": pb,
             "hands_in_shopping_cart_prob": pc,
             "hands_in_shopping_basket_or_cart_prob": float(pb + pc),
@@ -467,6 +513,8 @@ def run_single_image_probe(
     clf: SiglipSO400MClassifier,
     image_path: Path,
     *,
+    image_roi: tuple[int, int, int, int] | None,
+    dump_crops_dir: Path | None,
     output_json: Path | None,
 ) -> dict[str, Any]:
     """Una imagen → mismos vectores que en sesión; imprime tabla y opcionalmente guarda JSON."""
@@ -476,6 +524,20 @@ def run_single_image_probe(
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None or bgr.size == 0:
         raise RuntimeError(f"No se pudo leer la imagen: {path}")
+    if image_roi is not None:
+        x1, y1, x2, y2 = image_roi
+        h, w = bgr.shape[:2]
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(x1 + 1, min(w, x2))
+        y2 = max(y1 + 1, min(h, y2))
+        bgr = bgr[y1:y2, x1:x2]
+    if dump_crops_dir is not None:
+        dump_crops_dir.mkdir(parents=True, exist_ok=True)
+        crops, _weights = clf._build_crops(bgr)
+        cv2.imwrite(str(dump_crops_dir / "probe_input.jpg"), bgr)
+        for i, c in enumerate(crops):
+            cv2.imwrite(str(dump_crops_dir / f"probe_crop_{i:02d}.jpg"), c)
     t0 = time.perf_counter()
     out = clf.encode_frame_vectors(bgr)
     wall = time.perf_counter() - t0
@@ -496,6 +558,8 @@ def run_single_image_probe(
         )
     report: dict[str, Any] = {
         "image_path": str(path),
+        "image_roi_xyxy": list(image_roi) if image_roi is not None else None,
+        "probe_input_shape_hwc": [int(bgr.shape[0]), int(bgr.shape[1]), int(bgr.shape[2])],
         "vlm_model": clf.model_name,
         "device": str(clf.device),
         "multicrop_mode": clf.multicrop_mode,
@@ -528,6 +592,8 @@ def run_single_image_probe(
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n[probe] JSON: {output_json}", flush=True)
+    if dump_crops_dir is not None:
+        print(f"[probe] Crops guardados en: {dump_crops_dir}", flush=True)
     return report
 
 
@@ -558,8 +624,14 @@ def main() -> None:
     p.add_argument(
         "--decision-mode",
         default="weighted",
-        choices=["weighted", "majority"],
-        help="weighted: score ponderado; majority: voto por mayoría entre crops.",
+        choices=["weighted", "majority", "best_crop"],
+        help="weighted: score ponderado; majority: voto por mayoría; best_crop: usa solo el crop con mayor net=objeto-vacío.",
+    )
+    p.add_argument(
+        "--prompt-profile",
+        default="default",
+        choices=sorted(_PROMPT_PROFILES.keys()),
+        help="Perfil rápido de prompts para A/B de falsos positivos.",
     )
     p.add_argument(
         "--session-dir",
@@ -589,6 +661,16 @@ def main() -> None:
         default="",
         help="Opcional con --image: guarda el informe en este .json.",
     )
+    p.add_argument(
+        "--image-roi",
+        default="",
+        help="Solo con --image: ROI manual x1,y1,x2,y2 (pixel) para recortar antes del multicrop.",
+    )
+    p.add_argument(
+        "--dump-crops-dir",
+        default="",
+        help="Solo con --image: carpeta donde guardar probe_input.jpg y probe_crop_XX.jpg para depurar.",
+    )
     args = parse_args(p)
     # Variante v2: ROI local por lado (torso superior + manos), evitando frame completo.
     args.per_hand_fast = True
@@ -617,6 +699,7 @@ def main() -> None:
         args.vlm_model,
         args.device,
         args.vlm_prompt,
+        prompt_profile=str(args.prompt_profile),
         net_th=float(args.net_th),
         net_margin_th=float(args.net_margin_th),
         decision_mode=str(args.decision_mode),
@@ -625,9 +708,25 @@ def main() -> None:
     if image_s:
         print(f"[probe] Modelo listo: {args.vlm_model} | dispositivo: {clf.device}", flush=True)
         img_json = str(getattr(args, "image_output_json", "") or "").strip()
+        roi_s = str(getattr(args, "image_roi", "") or "").strip()
+        dump_s = str(getattr(args, "dump_crops_dir", "") or "").strip()
+        roi_xyxy: tuple[int, int, int, int] | None = None
+        if roi_s:
+            toks = [t.strip() for t in roi_s.split(",")]
+            if len(toks) != 4:
+                raise RuntimeError("--image-roi debe ser x1,y1,x2,y2")
+            try:
+                x1, y1, x2, y2 = (int(toks[0]), int(toks[1]), int(toks[2]), int(toks[3]))
+            except ValueError as e:
+                raise RuntimeError("--image-roi debe contener enteros: x1,y1,x2,y2") from e
+            if x2 <= x1 or y2 <= y1:
+                raise RuntimeError("--image-roi inválido: se requiere x2>x1 e y2>y1")
+            roi_xyxy = (x1, y1, x2, y2)
         run_single_image_probe(
             clf,
             Path(image_s),
+            image_roi=roi_xyxy,
+            dump_crops_dir=Path(dump_s).expanduser().resolve() if dump_s else None,
             output_json=Path(img_json).expanduser().resolve() if img_json else None,
         )
         return
