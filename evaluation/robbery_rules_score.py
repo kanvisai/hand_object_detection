@@ -75,10 +75,11 @@ def main() -> None:
     p.add_argument("--output-json", default="")
     p.add_argument("--smooth-window", type=int, default=3)
     p.add_argument("--min-object-run", type=int, default=2)
-    p.add_argument("--lookahead-runs", type=int, default=3, help="Cuántos runs mirar tras object_in_hand.")
-    p.add_argument("--w-suspicious", type=float, default=0.22)
-    p.add_argument("--w-normal", type=float, default=0.18)
-    p.add_argument("--base", type=float, default=0.35)
+    p.add_argument("--lookahead-runs", type=int, default=4, help="Cuántos runs mirar tras object_in_hand.")
+    p.add_argument("--w-severe", type=float, default=0.55, help="Peso patrón severo: object->(gesture/unknown) sin contenedor ni recuperación.")
+    p.add_argument("--w-suspicious", type=float, default=0.30, help="Peso patrón sospechoso moderado.")
+    p.add_argument("--w-normal", type=float, default=0.30, help="Resta por patrón normal (contenedor).")
+    p.add_argument("--base", type=float, default=0.20)
     args = p.parse_args()
 
     frames: list[dict[str, Any]] = []
@@ -104,6 +105,7 @@ def main() -> None:
     labels = _smooth_mode(labels_raw, sw)
     rr = _runs(labels)
 
+    severe_events: list[dict[str, Any]] = []
     suspicious_events: list[dict[str, Any]] = []
     normal_events: list[dict[str, Any]] = []
 
@@ -115,11 +117,20 @@ def main() -> None:
         tail = rr[i + 1 : i + 1 + max(1, int(args.lookahead_runs))]
         has_container = any(_is_container(t["label"]) for t in tail)
         has_susp_follow = any(_is_suspicious_followup(t["label"]) for t in tail)
+        has_object_recovery = any(t["label"] == "object_in_hand" for t in tail)
 
         if has_container:
             normal_events.append(
                 {
                     "type": "object_then_container",
+                    "object_run": r,
+                    "tail_labels": [t["label"] for t in tail],
+                }
+            )
+        elif has_susp_follow and (not has_object_recovery):
+            severe_events.append(
+                {
+                    "type": "object_then_uncertain_or_gesture_without_container_and_without_recovery",
                     "object_run": r,
                     "tail_labels": [t["label"] for t in tail],
                 }
@@ -148,6 +159,7 @@ def main() -> None:
             normal_events.append({"type": "container_run", "run": r})
 
     score = float(args.base)
+    score += float(args.w_severe) * float(len(severe_events))
     score += float(args.w_suspicious) * float(len(suspicious_events))
     score -= float(args.w_normal) * float(len(normal_events))
     robbery_probability = max(0.0, min(1.0, score))
@@ -166,15 +178,18 @@ def main() -> None:
             "min_object_run": args.min_object_run,
             "lookahead_runs": args.lookahead_runs,
             "base": args.base,
+            "w_severe": args.w_severe,
             "w_suspicious": args.w_suspicious,
             "w_normal": args.w_normal,
         },
         "robbery_probability": round(float(robbery_probability), 4),
         "verdict": verdict,
         "counts": {
+            "severe_events": len(severe_events),
             "suspicious_events": len(suspicious_events),
             "normal_events": len(normal_events),
         },
+        "severe_events": severe_events,
         "suspicious_events": suspicious_events,
         "normal_events": normal_events,
         "label_sequence_smoothed": labels,
