@@ -17,14 +17,25 @@ SEMANTICS_SCHEMA_VERSION_NOTE = "Misma estructura que session_semantics; prompts
 
 # Nombre de fichero por chunk (solo nombre de carpeta + sufijo; sin modelo ni variante).
 VLM_SEMANTICS_FILENAME_SUFFIX = "_vlm.json"
+VLM_SEMANTICS_ERROR_SUFFIX = "_vlm_error.json"
 
 # Fichero agregado bajo chunk-main-dir.
 VLM_EVALUATION_FILENAME = "vlm_evaluation.json"
+# Si no hay datos suficientes / todo falló; evita confundir con “probabilidad 0 = no robo”.
+VLM_EVALUATION_ERROR_FILENAME = "vlm_evaluation_error.json"
+
+# Sentinel para métricas no calculables (no usar 0 como “sin robo”).
+SENTINEL_SCORE_UNAVAILABLE = -1
 
 
 def vlm_semantics_basename(chunk_stem: str) -> str:
     """p. ej. chunk_001 → chunk_001_vlm.json"""
     return f"{chunk_stem}{VLM_SEMANTICS_FILENAME_SUFFIX}"
+
+
+def vlm_error_semantics_basename(chunk_stem: str) -> str:
+    """Marcador escrito si run_semantics_rc1 falla por chunk (p. ej. chunk_001_vlm_error.json)."""
+    return f"{chunk_stem}{VLM_SEMANTICS_ERROR_SUFFIX}"
 
 
 def write_json_stdout(payload: dict[str, Any], *, pretty: bool = False) -> None:

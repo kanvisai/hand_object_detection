@@ -41,6 +41,10 @@ def enrich_semantics_payload(payload: dict[str, Any]) -> dict[str, Any]:
     Solo cuentan frames donde `evaluable`/`vlm_applied` es verdadero: si no hay muñeca visible
     en `frames_meta`, session_semantics no ejecuta el VLM en ese frame.
     """
+    if payload.get("vlm_rc1_pipeline_status") == "error":
+        return payload
+    if str(payload.get("schema_version", "")).startswith("vlm_rc1_semantics_error"):
+        return payload
     frames = payload.get("frames")
     if not isinstance(frames, list):
         frames = []

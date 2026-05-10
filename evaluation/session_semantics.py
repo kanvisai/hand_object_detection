@@ -161,6 +161,7 @@ def run_chunk_semantics(
     max_entropy: float | None,
     quiet: bool,
     persist_json: bool = True,
+    continue_on_inference_error: bool = False,
 ) -> dict[str, Any]:
     chunk_dir = _validate_chunk_dir(chunk_dir)
     chunk_name = chunk_dir.name
@@ -183,6 +184,7 @@ def run_chunk_semantics(
 
     records: list[dict[str, Any]] = []
     t0 = time.perf_counter()
+    inference_failure_count = 0
 
     for i, row in enumerate(plan, start=1):
         image_key = str(row.get("image_key") or "").strip()
@@ -294,7 +296,42 @@ def run_chunk_semantics(
                 progress_label, i, total, chunk_name, image_key, f"{lab}…", elapsed_s=elapsed_pre, eta_s=eta_pre
             )
 
-        out = clf.encode_frame_vectors(bgr)
+        try:
+            out = clf.encode_frame_vectors(bgr)
+        except Exception as e:
+            if not continue_on_inference_error:
+                raise
+            inference_failure_count += 1
+            records.append(
+                {
+                    **base,
+                    "evaluable": False,
+                    "vlm_applied": False,
+                    "skip_reason": "vlm_inference_error",
+                    "semantic_label": None,
+                    "semantic_code": CODE_NOT_EVALUABLE,
+                    "vlm_vector_prompt_probs": None,
+                    "vlm_vector_prompt_logits": None,
+                    "gated_yes_prob": None,
+                    "latency_sec": None,
+                    "hands_in_shopping_basket_prob": None,
+                    "hands_in_shopping_cart_prob": None,
+                    "hands_in_personal_bag_prob": None,
+                    "hands_in_shopping_basket_or_cart_prob": None,
+                    "hands_basket_cart_or_personal_bag_prob": None,
+                    "max_prob": None,
+                    "second_prob": None,
+                    "margin": None,
+                    "entropy": None,
+                    "disambiguation_passed": None,
+                    "disambiguation_reason": "vlm_inference_error",
+                    "vlm_inference_error_message": str(e)[:500],
+                    "fused_image_embedding": None,
+                }
+            )
+            _progress("omitir (error inferencia VLM)")
+            continue
+
         probs = np.asarray(out["fused_prompt_probs"], dtype=np.float64)
         disc = _disambiguate(
             probs,
@@ -303,7 +340,7 @@ def run_chunk_semantics(
             max_entropy=max_entropy,
         )
 
-        rec: dict[str, Any] = {
+        rec = {
             **base,
             "evaluable": True,
             "vlm_applied": True,
@@ -374,6 +411,9 @@ def run_chunk_semantics(
         },
         "frames": records,
     }
+
+    if continue_on_inference_error:
+        payload["vlm_inference_failure_count"] = inference_failure_count
 
     if persist_json:
         output_json.parent.mkdir(parents=True, exist_ok=True)

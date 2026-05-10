@@ -3,9 +3,8 @@
 Pipeline rc1: semántica para **una carpeta de chunk** (`frames/` + `frames_meta.json`)
 con prompts definidos en `vlm_rc1_prompts.py` y **SigLIP** únicamente.
 
-Escribe el mismo JSON en **stdout** (una línea, UTF-8) para que otro proceso lo capture (p. ej. MinIO).
-Los mensajes `[vlm_rc1]` van a **stderr**. Por defecto también guarda fichero junto a `frames_meta.json`:
-`<chunk_stem>_vlm.json` (p. ej. `chunk_001_vlm.json`).
+En producción: fallos por frame no abortan el chunk; fallo total escribe `*_vlm_error.json`
+y JSON en stdout con `vlm_rc1_pipeline_status` / sentinel -1. Salida del proceso: código 0.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
 _EVAL = Path(__file__).resolve().parent.parent
@@ -25,7 +25,12 @@ for _p in (_EVAL, _RCDIR):
 from session_semantics import _bootstrap_hf_auth, run_chunk_semantics  # noqa: E402
 from vlm_factory import create_retail_vlm  # noqa: E402
 
-from vlm_rc1_config import vlm_semantics_basename, write_json_stdout  # noqa: E402
+from vlm_rc1_config import (  # noqa: E402
+    vlm_error_semantics_basename,
+    vlm_semantics_basename,
+    write_json_stdout,
+)
+from vlm_rc1_errors import semantics_runtime_error_payload  # noqa: E402
 from vlm_rc1_metrics import enrich_semantics_payload  # noqa: E402
 from vlm_rc1_prompts import PROMPT_VARIANT_ID, RC1_PROMPT_TEXTS_EN, assert_prompts_ok  # noqa: E402
 
@@ -99,41 +104,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    _bootstrap_hf_auth(args)
-
-    assert_prompts_ok()
-    pv_id = PROMPT_VARIANT_ID
-
-    chunk_dir = Path(args.chunk_dir).expanduser().resolve()
-    out_s = str(args.output_json or "").strip()
-
-    max_ent = float(args.max_entropy)
-    max_entropy = None if max_ent < 0 else max_ent
-
-    variant_texts = list(RC1_PROMPT_TEXTS_EN)
 
     def _log(msg: str) -> None:
         if not args.quiet:
             print(msg, file=sys.stderr, flush=True)
 
-    _log(f"[vlm_rc1] SigLIP | prompt={pv_id} — cargando…")
-    clf = create_retail_vlm(
-        _BACKEND,
-        device=str(args.device),
-        hf_model=str(args.vlm_model),
-        openclip_model="ViT-B-32",
-        openclip_pretrained="laion2b_s34b_b79k",
-        mobileclip_model="MobileCLIP2-S0",
-        mobileclip_pretrained="dfndr2b",
-        net_th=float(args.net_th),
-        net_margin_th=float(args.net_margin_th),
-        decision_mode=str(args.decision_mode),
-        multicrop_mode=str(args.multicrop_mode),
-        prompt_texts_en=variant_texts,
-    )
-    _log(f"[vlm_rc1] SigLIP listo en {clf.device} ({clf.model_name})")
-
+    chunk_dir = Path(args.chunk_dir).expanduser().resolve()
     chunk_stem = chunk_dir.name or "chunk"
+    out_s = str(args.output_json or "").strip()
+
+    max_ent = float(args.max_entropy)
+    max_entropy = None if max_ent < 0 else max_ent
+
     if args.no_write_file:
         output_json = Path(os.devnull)
     elif out_s:
@@ -141,35 +123,91 @@ def main() -> None:
     else:
         output_json = chunk_dir / vlm_semantics_basename(chunk_stem)
 
-    payload = run_chunk_semantics(
-        chunk_dir,
-        clf,
-        vlm_backend=_BACKEND,
-        prompt_variant_id=pv_id,
-        output_json=output_json,
-        emit_image_embedding=bool(args.emit_image_embedding),
-        tau_max_prob=float(args.tau_max_prob),
-        min_margin=float(args.min_margin),
-        max_entropy=max_entropy,
-        quiet=True,
-        persist_json=False,
-    )
-    enrich_semantics_payload(payload)
+    error_marker_path = chunk_dir / vlm_error_semantics_basename(chunk_stem)
 
-    if not args.no_write_file:
-        output_json.parent.mkdir(parents=True, exist_ok=True)
-        output_json.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+    try:
+        _bootstrap_hf_auth(args)
+        assert_prompts_ok()
+        pv_id = PROMPT_VARIANT_ID
+        variant_texts = list(RC1_PROMPT_TEXTS_EN)
+
+        _log(f"[vlm_rc1] SigLIP | prompt={pv_id} — cargando…")
+        clf = create_retail_vlm(
+            _BACKEND,
+            device=str(args.device),
+            hf_model=str(args.vlm_model),
+            openclip_model="ViT-B-32",
+            openclip_pretrained="laion2b_s34b_b79k",
+            mobileclip_model="MobileCLIP2-S0",
+            mobileclip_pretrained="dfndr2b",
+            net_th=float(args.net_th),
+            net_margin_th=float(args.net_margin_th),
+            decision_mode=str(args.decision_mode),
+            multicrop_mode=str(args.multicrop_mode),
+            prompt_texts_en=variant_texts,
         )
+        _log(f"[vlm_rc1] SigLIP listo en {clf.device} ({clf.model_name})")
 
-    write_json_stdout(payload, pretty=bool(args.pretty_json))
-    if not args.quiet:
-        if args.no_write_file:
-            _log("[vlm_rc1] Sin escritura en disco (--no-write-file); JSON solo en stdout.")
-        else:
-            _log(f"[vlm_rc1] JSON escrito: {output_json.resolve()}")
+        payload = run_chunk_semantics(
+            chunk_dir,
+            clf,
+            vlm_backend=_BACKEND,
+            prompt_variant_id=pv_id,
+            output_json=output_json,
+            emit_image_embedding=bool(args.emit_image_embedding),
+            tau_max_prob=float(args.tau_max_prob),
+            min_margin=float(args.min_margin),
+            max_entropy=max_entropy,
+            quiet=True,
+            persist_json=False,
+            continue_on_inference_error=True,
+        )
+        enrich_semantics_payload(payload)
+        payload["vlm_rc1_pipeline_status"] = "ok"
+
+        n_fail = int(payload.get("vlm_inference_failure_count") or 0)
+        if n_fail and not args.quiet:
+            _log(f"[vlm_rc1] Aviso: {n_fail} frame(s) con fallo de inferencia VLM (se siguieron procesando el resto).")
+
+        if not args.no_write_file:
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                if error_marker_path.is_file():
+                    error_marker_path.unlink()
+            except OSError:
+                pass
+
+        write_json_stdout(payload, pretty=bool(args.pretty_json))
+        if not args.quiet:
+            if args.no_write_file:
+                _log("[vlm_rc1] Sin escritura en disco (--no-write-file); JSON solo en stdout.")
+            else:
+                _log(f"[vlm_rc1] JSON escrito: {output_json.resolve()}")
+
+    except Exception as e:
+        err_payload = semantics_runtime_error_payload(
+            chunk_dir=chunk_dir,
+            chunk_stem=chunk_stem,
+            exc=e,
+            stage="run_semantics_rc1",
+        )
+        _log(f"[vlm_rc1] ERROR (no aborta proceso): {e}\n{traceback.format_exc()}")
+
+        if not args.no_write_file:
+            try:
+                error_marker_path.parent.mkdir(parents=True, exist_ok=True)
+                error_marker_path.write_text(
+                    json.dumps(err_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _log(f"[vlm_rc1] Marcador de error escrito: {error_marker_path.resolve()}")
+            except Exception as w:
+                _log(f"[vlm_rc1] No se pudo escribir {error_marker_path}: {w}")
+
+        write_json_stdout(err_payload, pretty=bool(args.pretty_json))
 
 
 if __name__ == "__main__":
     main()
+    sys.exit(0)
