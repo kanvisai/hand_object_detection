@@ -69,27 +69,22 @@ def _is_suspicious_followup(label: str | None) -> bool:
     return label in {"gesture_no_object", "pockets_hidden", "unknown"}
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Probabilidad de robo por reglas de secuencia.")
-    p.add_argument("--input-json", nargs="+", required=True, metavar="JSON")
-    p.add_argument("--output-json", default="")
-    p.add_argument("--smooth-window", type=int, default=3)
-    p.add_argument("--min-object-run", type=int, default=2)
-    p.add_argument("--lookahead-runs", type=int, default=4, help="Cuántos runs mirar tras object_in_hand.")
-    p.add_argument("--w-severe", type=float, default=0.55, help="Peso patrón severo: object->(gesture/unknown) sin contenedor ni recuperación.")
-    p.add_argument("--w-suspicious", type=float, default=0.30, help="Peso patrón sospechoso moderado.")
-    p.add_argument("--w-normal", type=float, default=0.30, help="Resta por patrón normal (contenedor).")
-    p.add_argument("--base", type=float, default=0.20)
-    args = p.parse_args()
-
-    frames: list[dict[str, Any]] = []
-    for pj in args.input_json:
-        data = _load(Path(pj).expanduser().resolve())
-        if isinstance(data, dict):
-            frs = data.get("frames")
-            if isinstance(frs, list):
-                frames.extend([x for x in frs if isinstance(x, dict)])
-    ordered = _sorted_frames(frames)
+def compute_robbery_rules_score(
+    frames: list[dict[str, Any]],
+    *,
+    smooth_window: int = 3,
+    min_object_run: int = 2,
+    lookahead_runs: int = 4,
+    w_severe: float = 0.55,
+    w_suspicious: float = 0.30,
+    w_normal: float = 0.30,
+    base: float = 0.20,
+) -> dict[str, Any]:
+    """
+    Misma lógica que la CLI: una lista plana de dicts `frames` (como en JSON de session_semantics).
+    Devuelve el objeto de resultado sin campo `inputs` (añádelo en el llamador si hace falta).
+    """
+    ordered = _sorted_frames(list(frames))
 
     labels_raw: list[str | None] = []
     for fr in ordered:
@@ -99,7 +94,7 @@ def main() -> None:
         lab = fr.get("semantic_label")
         labels_raw.append(str(lab) if lab else None)
 
-    sw = max(1, int(args.smooth_window))
+    sw = max(1, int(smooth_window))
     if sw % 2 == 0:
         sw += 1
     labels = _smooth_mode(labels_raw, sw)
@@ -111,10 +106,10 @@ def main() -> None:
 
     for i, r in enumerate(rr):
         lab = r["label"]
-        if lab != "object_in_hand" or int(r["length"]) < int(args.min_object_run):
+        if lab != "object_in_hand" or int(r["length"]) < int(min_object_run):
             continue
 
-        tail = rr[i + 1 : i + 1 + max(1, int(args.lookahead_runs))]
+        tail = rr[i + 1 : i + 1 + max(1, int(lookahead_runs))]
         has_container = any(_is_container(t["label"]) for t in tail)
         has_susp_follow = any(_is_suspicious_followup(t["label"]) for t in tail)
         has_object_recovery = any(t["label"] == "object_in_hand" for t in tail)
@@ -144,7 +139,6 @@ def main() -> None:
                 }
             )
         else:
-            # objeto -> no objeto sin explicación clara de contenedor
             suspicious_events.append(
                 {
                     "type": "object_then_nonobject_without_container",
@@ -153,15 +147,14 @@ def main() -> None:
                 }
             )
 
-    # Contenedor prolongado sin objeto previo suele ser compra normal/contexto normal.
     for r in rr:
         if _is_container(r["label"]) and int(r["length"]) >= 2:
             normal_events.append({"type": "container_run", "run": r})
 
-    score = float(args.base)
-    score += float(args.w_severe) * float(len(severe_events))
-    score += float(args.w_suspicious) * float(len(suspicious_events))
-    score -= float(args.w_normal) * float(len(normal_events))
+    score = float(base)
+    score += float(w_severe) * float(len(severe_events))
+    score += float(w_suspicious) * float(len(suspicious_events))
+    score -= float(w_normal) * float(len(normal_events))
     robbery_probability = max(0.0, min(1.0, score))
 
     if robbery_probability >= 0.65:
@@ -171,16 +164,15 @@ def main() -> None:
     else:
         verdict = "uncertain"
 
-    out = {
-        "inputs": [str(Path(p).expanduser().resolve()) for p in args.input_json],
+    return {
         "params": {
             "smooth_window": sw,
-            "min_object_run": args.min_object_run,
-            "lookahead_runs": args.lookahead_runs,
-            "base": args.base,
-            "w_severe": args.w_severe,
-            "w_suspicious": args.w_suspicious,
-            "w_normal": args.w_normal,
+            "min_object_run": int(min_object_run),
+            "lookahead_runs": int(lookahead_runs),
+            "base": float(base),
+            "w_severe": float(w_severe),
+            "w_suspicious": float(w_suspicious),
+            "w_normal": float(w_normal),
         },
         "robbery_probability": round(float(robbery_probability), 4),
         "verdict": verdict,
@@ -193,6 +185,41 @@ def main() -> None:
         "suspicious_events": suspicious_events,
         "normal_events": normal_events,
         "label_sequence_smoothed": labels,
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Probabilidad de robo por reglas de secuencia.")
+    p.add_argument("--input-json", nargs="+", required=True, metavar="JSON")
+    p.add_argument("--output-json", default="")
+    p.add_argument("--smooth-window", type=int, default=3)
+    p.add_argument("--min-object-run", type=int, default=2)
+    p.add_argument("--lookahead-runs", type=int, default=4, help="Cuántos runs mirar tras object_in_hand.")
+    p.add_argument("--w-severe", type=float, default=0.55, help="Peso patrón severo: object->(gesture/unknown) sin contenedor ni recuperación.")
+    p.add_argument("--w-suspicious", type=float, default=0.30, help="Peso patrón sospechoso moderado.")
+    p.add_argument("--w-normal", type=float, default=0.30, help="Resta por patrón normal (contenedor).")
+    p.add_argument("--base", type=float, default=0.20)
+    args = p.parse_args()
+
+    frames: list[dict[str, Any]] = []
+    for pj in args.input_json:
+        data = _load(Path(pj).expanduser().resolve())
+        if isinstance(data, dict):
+            frs = data.get("frames")
+            if isinstance(frs, list):
+                frames.extend([x for x in frs if isinstance(x, dict)])
+    out = {
+        "inputs": [str(Path(p).expanduser().resolve()) for p in args.input_json],
+        **compute_robbery_rules_score(
+            frames,
+            smooth_window=int(args.smooth_window),
+            min_object_run=int(args.min_object_run),
+            lookahead_runs=int(args.lookahead_runs),
+            w_severe=float(args.w_severe),
+            w_suspicious=float(args.w_suspicious),
+            w_normal=float(args.w_normal),
+            base=float(args.base),
+        ),
     }
 
     txt = json.dumps(out, ensure_ascii=False, indent=2)
