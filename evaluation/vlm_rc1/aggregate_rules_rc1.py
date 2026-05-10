@@ -2,12 +2,10 @@
 """
 Agrega JSON de semántica rc1 por todos los chunks bajo una carpeta y aplica `robbery_rules_score`.
 
-Busca en cada subcarpeta de chunk el JSON generado por `run_semantics_rc1.py` (una ejecución por chunk con `--chunk-dir`).
-(por defecto `<chunk_stem>_siglip_<PROMPT_VARIANT_ID>.json` desde `vlm_rc1_prompts.py`), concatena `frames` en orden
-y calcula probabilidad de robo con la misma lógica que `robbery_rules_score.py`.
+Busca en cada subcarpeta el fichero `<chunk_stem>_vlm.json` generado por `run_semantics_rc1.py`,
+concatena `frames` en orden y calcula probabilidad de robo.
 
-Por defecto guarda `<chunk-main-dir>/vlm_rc1_robbery_evaluation.json` y escribe el **mismo**
-objeto JSON en **stdout** (una línea). Mensajes `[vlm_rc1]` en stderr.
+Por defecto guarda `<chunk-main-dir>/vlm_evaluation.json` y escribe el mismo objeto JSON en **stdout**.
 """
 
 from __future__ import annotations
@@ -28,11 +26,27 @@ for _p in (_EVAL, _RCDIR):
 from robbery_rules_score import compute_robbery_rules_score  # noqa: E402
 from session_semantics import discover_chunk_dirs_under_parent  # noqa: E402
 
-from vlm_rc1_config import PROMPT_VARIANT_ID, semantics_filename_for_chunk, write_json_stdout  # noqa: E402
+from vlm_rc1_config import VLM_EVALUATION_FILENAME, vlm_semantics_basename, write_json_stdout  # noqa: E402
+from vlm_rc1_metrics import (  # noqa: E402
+    mean_probability_pct,
+    object_in_hand_probs_evaluable_frames,
+)
+from vlm_rc1_prompts import PROMPT_VARIANT_ID  # noqa: E402
 
 
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_semantics_json(chunk_dir: Path) -> Path | None:
+    """`<stem>_vlm.json` o un único `*_vlm.json` en la carpeta del chunk."""
+    expected = chunk_dir / vlm_semantics_basename(chunk_dir.name)
+    if expected.is_file():
+        return expected
+    alts = sorted(chunk_dir.glob("*_vlm.json"))
+    if len(alts) == 1:
+        return alts[0]
+    return None
 
 
 def _collect_frames_from_semantics_files(paths: list[Path]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -52,6 +66,39 @@ def _collect_frames_from_semantics_files(paths: list[Path]) -> tuple[list[dict[s
     return frames, errors
 
 
+def _find_last_chunk_with_evaluable_vlm_frames(
+    chunk_dirs: list[Path],
+    load_errors: list[str],
+) -> tuple[Path | None, str | None, list[dict[str, Any]], list[str]]:
+    """
+    Desde el último chunk (orden temporal = discover), busca el primero que tenga **al menos un
+    frame evaluable** donde se aplicó el VLM (p. ej. muñeca visible en meta). Si el último chunk
+    solo tiene omisiones (`no_wrist_visibility`, etc.), retrocede hasta encontrar uno válido.
+
+    Devuelve (path_json, nombre_chunk, frames_raw, chunks_saltados_sin_vlm_evaluable).
+    Los «saltados» son chunks más recientes que tenían *_vlm.json pero 0 frames con probs VLM.
+    """
+    skipped_newer: list[str] = []
+    for ch in reversed(chunk_dirs):
+        p = _resolve_semantics_json(ch)
+        if p is None:
+            continue
+        try:
+            data = _load_json(p)
+        except Exception as e:
+            load_errors.append(f"{p}: último-chunk-válido — {e}")
+            continue
+        frs = data.get("frames")
+        if not isinstance(frs, list):
+            continue
+        frames = [x for x in frs if isinstance(x, dict)]
+        probs = object_in_hand_probs_evaluable_frames(frames)
+        if probs:
+            return p, ch.name, frames, skipped_newer
+        skipped_newer.append(ch.name)
+    return None, None, [], skipped_newer
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="vlm_rc1: reglas de robo agregadas sobre todos los chunks.")
     p.add_argument(
@@ -62,15 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directorio que contiene chunk_001, chunk_002, … (cada uno con frames/ + frames_meta.json).",
     )
     p.add_argument(
-        "--vlm-backend",
-        default="siglip",
-        choices=["siglip", "openclip", "mobileclip"],
-        help="Debe coincidir con el backend usado en run_semantics_rc1.",
-    )
-    p.add_argument(
         "--output-json",
         default="",
-        help="Ruta del JSON de evaluación (por defecto <chunk-main-dir>/vlm_rc1_robbery_evaluation.json).",
+        help=f"Ruta del JSON de evaluación (por defecto <chunk-main-dir>/{VLM_EVALUATION_FILENAME}).",
     )
     p.add_argument("--smooth-window", type=int, default=3)
     p.add_argument("--min-object-run", type=int, default=2)
@@ -110,9 +151,6 @@ def main() -> None:
         print(f"No es un directorio: {root}", file=sys.stderr)
         raise SystemExit(1)
 
-    pv_id = PROMPT_VARIANT_ID
-    backend = str(args.vlm_backend)
-
     chunk_dirs = discover_chunk_dirs_under_parent(root)
     if not chunk_dirs:
         print(
@@ -124,17 +162,11 @@ def main() -> None:
     semantics_paths: list[Path] = []
     missing: list[str] = []
     for ch in chunk_dirs:
-        expected_name = semantics_filename_for_chunk(ch.name, backend, pv_id)
-        cand = ch / expected_name
-        if cand.is_file():
+        cand = _resolve_semantics_json(ch)
+        if cand is not None:
             semantics_paths.append(cand)
             continue
-        # Resolución laxa: un único *.json que coincida con sufijo _backend_variant.json
-        alt = sorted(ch.glob(f"*_{backend}_*.json"))
-        if len(alt) == 1:
-            semantics_paths.append(alt[0])
-            continue
-        missing.append(f"{ch} (esperado {expected_name})")
+        missing.append(f"{ch} (esperado {vlm_semantics_basename(ch.name)})")
 
     if missing and args.strict:
         print("Faltan JSON de semántica en:\n  " + "\n  ".join(missing), file=sys.stderr)
@@ -142,9 +174,8 @@ def main() -> None:
 
     if not semantics_paths:
         print(
-            "No se encontró ningún JSON de semántica rc1. Ejecuta antes run_semantics_rc1.py por cada chunk "
-            f"y revisa `PROMPT_VARIANT_ID` en vlm_rc1_prompts.py / --vlm-backend (esperado por chunk: "
-            f"{semantics_filename_for_chunk('chunk_XXX', backend, pv_id)}).",
+            "No se encontró ningún JSON *_vlm.json. Ejecuta run_semantics_rc1.py por cada chunk "
+            f"(fichero esperado: {vlm_semantics_basename('chunk_XXX')}).",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -161,24 +192,47 @@ def main() -> None:
         base=float(args.base),
     )
 
+    last_path, last_name, last_frames, skipped_newer_empty_vlm = _find_last_chunk_with_evaluable_vlm_frames(
+        chunk_dirs,
+        load_errors,
+    )
+    last_probs = object_in_hand_probs_evaluable_frames(last_frames)
+    last_pct = mean_probability_pct(last_probs)
+
     out_path_s = str(args.output_json or "").strip()
     if args.no_write_file:
         out_path = Path(os.devnull)
     elif out_path_s:
         out_path = Path(out_path_s).expanduser().resolve()
     else:
-        out_path = root / "vlm_rc1_robbery_evaluation.json"
+        out_path = root / VLM_EVALUATION_FILENAME
 
     payload: dict[str, Any] = {
-        "schema_version": "vlm_rc1_aggregate_rules_1.0",
+        "schema_version": "vlm_rc1_aggregate_rules_1.2",
         "chunk_main_dir": str(root),
-        "prompt_variant_id": pv_id,
-        "vlm_backend": backend,
+        "prompt_variant_id_internal": PROMPT_VARIANT_ID,
         "semantics_inputs": [str(p) for p in semantics_paths],
         "chunks_discovered": len(chunk_dirs),
         "chunks_with_semantics_json": len(semantics_paths),
         "chunks_missing_semantics_json": missing,
         "load_errors": load_errors,
+        "last_chunk_object_visible_hands_pct": last_pct,
+        "last_chunk_object_visible_hands": {
+            "chunk_used_for_metric": last_name,
+            "semantics_json": str(last_path) if last_path else None,
+            "evaluable_frames": len(last_probs),
+            "mean_softmax_object_in_hand_probability_pct": last_pct,
+            "chunks_skipped_newer_no_evaluable_vlm": skipped_newer_empty_vlm,
+            "selection_policy": (
+                "Último chunk en orden temporal que tenga ≥1 frame con VLM aplicado "
+                "(p. ej. muñeca visible en frames_meta). Si el último chunk no tiene persona/"
+                "muñecas, todos los frames van sin VLM y se retrocede al chunk válido anterior."
+            ),
+            "vlm_gating_note": (
+                "Sin muñeca visible (visible_wrists_count==0 y ambas false), session_semantics "
+                "no ejecuta el VLM (skip_reason no_wrist_visibility)."
+            ),
+        },
         "aggregation_note": "Frames de todos los chunks fusionados y ordenados por (chunk, sample_idx).",
         **result_body,
     }
@@ -191,7 +245,8 @@ def main() -> None:
 
     _log(f"[vlm_rc1] Evaluación guardada: {out_path.resolve()}" if not args.no_write_file else "[vlm_rc1] Sin escritura en disco (--no-write-file); JSON solo en stdout.")
     _log(
-        f"[vlm_rc1] robbery_probability={payload['robbery_probability']} verdict={payload['verdict']} "
+        f"[vlm_rc1] robbery_probability={payload['robbery_probability']} "
+        f"last_chunk_object_visible_hands_pct={payload['last_chunk_object_visible_hands_pct']} "
         f"(chunks con JSON: {len(semantics_paths)}/{len(chunk_dirs)})"
     )
 

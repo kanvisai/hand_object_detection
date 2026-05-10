@@ -5,12 +5,13 @@ con prompts definidos en `vlm_rc1_prompts.py` y **SigLIP** únicamente.
 
 Escribe el mismo JSON en **stdout** (una línea, UTF-8) para que otro proceso lo capture (p. ej. MinIO).
 Los mensajes `[vlm_rc1]` van a **stderr**. Por defecto también guarda fichero junto a `frames_meta.json`:
-`<chunk_stem>_siglip_<variant>.json` (`PROMPT_VARIANT_ID` en `vlm_rc1_prompts.py`).
+`<chunk_stem>_vlm.json` (p. ej. `chunk_001_vlm.json`).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,10 +22,11 @@ for _p in (_EVAL, _RCDIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from session_semantics import _bootstrap_hf_auth, _semantics_output_filename, run_chunk_semantics  # noqa: E402
+from session_semantics import _bootstrap_hf_auth, run_chunk_semantics  # noqa: E402
 from vlm_factory import create_retail_vlm  # noqa: E402
 
-from vlm_rc1_config import write_json_stdout  # noqa: E402
+from vlm_rc1_config import vlm_semantics_basename, write_json_stdout  # noqa: E402
+from vlm_rc1_metrics import enrich_semantics_payload  # noqa: E402
 from vlm_rc1_prompts import PROMPT_VARIANT_ID, RC1_PROMPT_TEXTS_EN, assert_prompts_ok  # noqa: E402
 
 _BACKEND = "siglip"
@@ -44,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--output-json",
         default="",
-        help="Ruta opcional del JSON; si se omite: <chunk-dir>/<stem>_siglip_<variant>.json",
+        help="Ruta opcional del JSON; si se omite: <chunk-dir>/<stem>_vlm.json",
     )
     p.add_argument(
         "--device",
@@ -109,7 +111,6 @@ def main() -> None:
     max_entropy = None if max_ent < 0 else max_ent
 
     variant_texts = list(RC1_PROMPT_TEXTS_EN)
-    all_pv_ids = [pv_id]
 
     def _log(msg: str) -> None:
         if not args.quiet:
@@ -138,8 +139,7 @@ def main() -> None:
     elif out_s:
         output_json = Path(out_s).expanduser().resolve()
     else:
-        fname = _semantics_output_filename(chunk_stem, _BACKEND, pv_id, all_pv_ids=all_pv_ids)
-        output_json = chunk_dir / fname
+        output_json = chunk_dir / vlm_semantics_basename(chunk_stem)
 
     payload = run_chunk_semantics(
         chunk_dir,
@@ -152,7 +152,16 @@ def main() -> None:
         min_margin=float(args.min_margin),
         max_entropy=max_entropy,
         quiet=True,
+        persist_json=False,
     )
+    enrich_semantics_payload(payload)
+
+    if not args.no_write_file:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     write_json_stdout(payload, pretty=bool(args.pretty_json))
     if not args.quiet:

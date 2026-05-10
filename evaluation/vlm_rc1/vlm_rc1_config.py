@@ -15,6 +15,17 @@ from vlm_rc1_prompts import PROMPT_VARIANT_ID
 
 SEMANTICS_SCHEMA_VERSION_NOTE = "Misma estructura que session_semantics; prompts definidos en vlm_rc1_prompts.py."
 
+# Nombre de fichero por chunk (solo nombre de carpeta + sufijo; sin modelo ni variante).
+VLM_SEMANTICS_FILENAME_SUFFIX = "_vlm.json"
+
+# Fichero agregado bajo chunk-main-dir.
+VLM_EVALUATION_FILENAME = "vlm_evaluation.json"
+
+
+def vlm_semantics_basename(chunk_stem: str) -> str:
+    """p. ej. chunk_001 → chunk_001_vlm.json"""
+    return f"{chunk_stem}{VLM_SEMANTICS_FILENAME_SUFFIX}"
+
 
 def write_json_stdout(payload: dict[str, Any], *, pretty: bool = False) -> None:
     """
@@ -27,15 +38,3 @@ def write_json_stdout(payload: dict[str, Any], *, pretty: bool = False) -> None:
         txt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write(txt + "\n")
     sys.stdout.flush()
-
-
-def _safe_variant_id(pv_id: str) -> str:
-    """Igual que session_semantics._semantics_output_filename (sufijo de fichero)."""
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in pv_id.strip())
-
-
-def semantics_filename_for_chunk(chunk_stem: str, backend: str, variant_id: str | None = None) -> str:
-    """Nombre esperado: `<chunk_stem>_<backend>_<variant>.json` (p. ej. chunk_001_siglip_frames_v2_probe.json)."""
-    vid = variant_id if variant_id is not None else PROMPT_VARIANT_ID
-    safe = _safe_variant_id(vid)
-    return f"{chunk_stem}_{backend}_{safe}.json"

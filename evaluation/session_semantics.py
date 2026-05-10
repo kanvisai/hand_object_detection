@@ -160,6 +160,7 @@ def run_chunk_semantics(
     min_margin: float,
     max_entropy: float | None,
     quiet: bool,
+    persist_json: bool = True,
 ) -> dict[str, Any]:
     chunk_dir = _validate_chunk_dir(chunk_dir)
     chunk_name = chunk_dir.name
@@ -374,8 +375,9 @@ def run_chunk_semantics(
         "frames": records,
     }
 
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if persist_json:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     wall = time.perf_counter() - t0
     if not quiet:
         print(f"[semantics] Listo en {wall:.1f}s -> {output_json}", flush=True)
