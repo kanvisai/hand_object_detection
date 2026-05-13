@@ -4,7 +4,8 @@ Pipeline rc1: semántica para **una carpeta de chunk** (`frames/` + `frames_meta
 con prompts definidos en `vlm_rc1_prompts.py` y **SigLIP** únicamente.
 
 En producción: fallos por frame no abortan el chunk; fallo total escribe `*_vlm_error.json`
-y JSON en stdout con `vlm_rc1_pipeline_status` / sentinel -1. Salida del proceso: código 0.
+y por defecto **un único JSON en stdout** (el proceso padre puede capturarlo con `subprocess.run(..., text=True).stdout`).
+Usa `--no-stdout-json` si no quieres JSON en stdout. Salida del proceso: código 0.
 """
 
 from __future__ import annotations
@@ -88,6 +89,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pretty-json",
         action="store_true",
         help="JSON formateado en stdout (por defecto: una línea compacta).",
+    )
+    p.add_argument(
+        "--no-stdout-json",
+        action="store_true",
+        help="No escribir el JSON en stdout (solo fichero / marcador de error). Por defecto sí: el proceso padre puede capturar stdout.",
     )
     p.add_argument(
         "--no-write-file",
@@ -178,12 +184,18 @@ def main() -> None:
             except OSError:
                 pass
 
-        write_json_stdout(payload, pretty=bool(args.pretty_json))
+        if not args.no_stdout_json:
+            write_json_stdout(payload, pretty=bool(args.pretty_json))
         if not args.quiet:
             if args.no_write_file:
-                _log("[vlm_rc1] Sin escritura en disco (--no-write-file); JSON solo en stdout.")
+                if args.no_stdout_json:
+                    _log("[vlm_rc1] Sin escritura en disco ni JSON en stdout.")
+                else:
+                    _log("[vlm_rc1] Sin escritura en disco (--no-write-file); JSON en stdout.")
             else:
                 _log(f"[vlm_rc1] JSON escrito: {output_json.resolve()}")
+                if args.no_stdout_json:
+                    _log("[vlm_rc1] Sin JSON en stdout (--no-stdout-json).")
 
     except Exception as e:
         err_payload = semantics_runtime_error_payload(
@@ -205,7 +217,8 @@ def main() -> None:
             except Exception as w:
                 _log(f"[vlm_rc1] No se pudo escribir {error_marker_path}: {w}")
 
-        write_json_stdout(err_payload, pretty=bool(args.pretty_json))
+        if not args.no_stdout_json:
+            write_json_stdout(err_payload, pretty=bool(args.pretty_json))
 
 
 if __name__ == "__main__":
