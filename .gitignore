@@ -216,3 +216,6 @@ __marimo__/
 *.venv
 output/
 models/
+
+# vlm_rc2 — configuración local (tokens HF); usar vlm_rc2.settings.example.json
+evaluation/vlm_rc2/vlm_rc2.settings.json

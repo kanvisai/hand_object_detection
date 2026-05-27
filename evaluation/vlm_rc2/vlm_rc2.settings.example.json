@@ -1,0 +1,33 @@
+{
+  "_comment": "Copia a vlm_rc2.settings.json y edita. Ubicación: carpeta vlm_rc2/ o cwd.",
+
+  "service": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "log_level": "info",
+    "skip_model_load": false
+  },
+
+  "client": {
+    "semantics_service_url": "http://127.0.0.1:8080",
+    "timeout_sec": 900
+  },
+
+  "model": {
+    "device": "cuda:0",
+    "hf_token": "",
+    "vlm_model": "google/siglip-so400m-patch14-384",
+    "multicrop_mode": "batch3",
+    "net_th": 0.35,
+    "net_margin_th": 0.3,
+    "decision_mode": "weighted",
+    "tau_max_prob": 0.35,
+    "min_margin": 0.08,
+    "max_entropy": -1,
+    "emit_image_embedding": false
+  },
+
+  "paths": {
+    "chunks_root": "/data/chunks"
+  }
+}

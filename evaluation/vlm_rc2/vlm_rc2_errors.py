@@ -11,6 +11,29 @@ from typing import Any
 from vlm_rc2_config import SENTINEL_SCORE_UNAVAILABLE
 
 
+def semantics_chunk_skipped_payload(
+    *,
+    chunk_dir: Path,
+    chunk_stem: str,
+    assessment: dict[str, Any],
+    stage: str = "run_chunk_semantics",
+) -> dict[str, Any]:
+    """Chunk no procesable (ruta inválida, etc.); no lanza excepción al llamador."""
+    return {
+        "schema_version": "vlm_rc2_semantics_skipped_1.0",
+        "vlm_rc2_pipeline_status": "skipped",
+        "chunk_dir": str(chunk_dir),
+        "chunk_name": chunk_stem,
+        "error_stage": stage,
+        "chunk_validation": assessment,
+        "chunk_validation_issues": list(assessment.get("issues") or []),
+        "chunk_validation_warnings": list(assessment.get("warnings") or []),
+        "frames": [],
+        "robbery_probability": SENTINEL_SCORE_UNAVAILABLE,
+        "note": "Chunk omitido: estructura no válida o no procesable.",
+    }
+
+
 def semantics_load_failed_payload(
     *,
     chunk_dir: Path,

@@ -25,6 +25,22 @@ def load_frames_meta(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_frames_meta_safe(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Carga frames_meta.json sin lanzar; devuelve (filas, avisos)."""
+    warnings: list[str] = []
+    if not path.is_file():
+        warnings.append("missing_frames_meta_json")
+        return [], warnings
+    try:
+        return load_frames_meta(path), warnings
+    except OSError as e:
+        warnings.append(f"frames_meta_unreadable:{e}")
+        return [], warnings
+    except (json.JSONDecodeError, RuntimeError, ValueError) as e:
+        warnings.append(f"frames_meta_invalid:{e}")
+        return [], warnings
+
+
 def session_progress_line(
     session_label: str,
     cur: int,

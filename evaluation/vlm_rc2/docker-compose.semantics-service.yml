@@ -1,0 +1,33 @@
+# Servicio persistente vlm_rc2 (modelo SigLIP en memoria).
+# Uso: desde esta carpeta vlm_rc2/
+#   docker compose -f docker-compose.semantics-service.yml up -d --build
+#
+# El orquestador y este servicio deben compartir el mismo volumen de chunks.
+
+services:
+  vlm-rc2-semantics:
+    build:
+      context: .
+      dockerfile: Dockerfile.semantics-service
+    image: vlm-rc2-semantics:local
+    restart: unless-stopped
+    ports:
+      - "${VLM_RC2_SERVICE_PORT:-8080}:8080"
+    volumes:
+      # Configuración (edita vlm_rc2.settings.json en el host antes de up)
+      - ./vlm_rc2.settings.json:/app/vlm_rc2/vlm_rc2.settings.json:ro
+      # Misma ruta dentro del contenedor que usa el orquestador al llamar run_semantics_rc2
+      - ${CHUNKS_HOST_PATH:-/data/chunks}:/data/chunks:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

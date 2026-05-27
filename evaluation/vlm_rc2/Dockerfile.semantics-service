@@ -1,0 +1,28 @@
+# Imagen del worker vlm_rc2 (copiar carpeta vlm_rc2/ al proyecto destino).
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/vlm_rc2
+
+# Copiar solo esta carpeta (autosuficiente)
+COPY . /app/vlm_rc2/
+
+# Instalar deps base + servicio (ajusta si el proyecto padre tiene requirements.txt)
+RUN pip3 install --upgrade pip && \
+    pip3 install \
+    numpy opencv-python-headless Pillow \
+    torch torchvision \
+    "transformers>=4.46.3,<5" huggingface_hub accelerate safetensors \
+    -r requirements-service.txt
+
+EXPOSE 8080
+
+CMD ["python3", "semantics_service.py"]

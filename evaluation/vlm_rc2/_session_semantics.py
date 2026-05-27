@@ -22,10 +22,12 @@ import numpy as np
 
 from _chunk_helpers import (
     frame_has_wrist_visibility as _frame_has_wrist_visibility,
-    load_frames_meta as _load_frames_meta,
+    load_frames_meta_safe as _load_frames_meta_safe,
     session_progress_line as _session_progress_line,
 )
+from _chunk_validation import assess_chunk_dir
 from retail_semantic_prompts import CANONICAL_LABELS, CODE_UNKNOWN, LABELS_ES
+from vlm_rc2_errors import semantics_chunk_skipped_payload
 
 SCHEMA_VERSION = "1.5"
 CODE_NOT_EVALUABLE = -1
@@ -65,8 +67,8 @@ def _natural_chunk_sort_key(path: Path) -> list[Any]:
 
 def discover_chunk_dirs_under_parent(parent: Path) -> list[Path]:
     """
-    Lista subcarpetas directas que son chunks válidos (`frames/` + `frames_meta.json`).
-    Orden "natural" por nombre (chunk_002 antes que chunk_010).
+    Lista subcarpetas directas procesables (directorio existente).
+    No exige frames/ ni frames_meta.json (pueden estar incompletos).
     """
     root = parent.expanduser().resolve()
     if not root.is_dir():
@@ -75,11 +77,8 @@ def discover_chunk_dirs_under_parent(parent: Path) -> list[Path]:
     for sub in root.iterdir():
         if not sub.is_dir() or sub.name.startswith("."):
             continue
-        try:
-            _validate_chunk_dir(sub)
-        except RuntimeError:
-            continue
-        found.append(sub)
+        if assess_chunk_dir(sub).get("processable"):
+            found.append(sub)
     return sorted(found, key=_natural_chunk_sort_key)
 
 
@@ -186,14 +185,25 @@ def run_chunk_semantics(
     persist_json: bool = True,
     continue_on_inference_error: bool = False,
 ) -> dict[str, Any]:
-    chunk_dir = _validate_chunk_dir(chunk_dir)
-    chunk_name = chunk_dir.name
+    chunk_dir = chunk_dir.expanduser().resolve()
+    chunk_name = chunk_dir.name or "chunk"
+    assessment = assess_chunk_dir(chunk_dir)
+    if not assessment.get("processable"):
+        return semantics_chunk_skipped_payload(
+            chunk_dir=chunk_dir,
+            chunk_stem=chunk_name,
+            assessment=assessment,
+        )
+
     progress_label = chunk_name or str(chunk_dir)
     texts = list(clf.texts)
     frames_dir = chunk_dir / "frames"
+    chunk_warnings: list[str] = list(assessment.get("warnings") or [])
 
     plan: list[dict[str, Any]] = []
-    for row in _load_frames_meta(chunk_dir / "frames_meta.json"):
+    meta_rows, meta_warnings = _load_frames_meta_safe(chunk_dir / "frames_meta.json")
+    chunk_warnings.extend(meta_warnings)
+    for row in meta_rows:
         if not str(row.get("image_key") or "").strip():
             continue
         plan.append(row)
@@ -296,7 +306,24 @@ def run_chunk_semantics(
             _progress("omitir (sin archivo)")
             continue
 
-        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        try:
+            bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        except Exception as e:
+            inference_failure_count += 1 if continue_on_inference_error else 0
+            records.append(
+                {
+                    **base,
+                    "evaluable": False,
+                    "vlm_applied": False,
+                    "skip_reason": "imread_exception",
+                    **skip_tail,
+                    "disambiguation_reason": "imread_exception",
+                    "imread_error_message": str(e)[:500],
+                }
+            )
+            _progress("omitir (excepción lectura)")
+            continue
+
         if bgr is None or bgr.size == 0:
             records.append(
                 {
@@ -414,6 +441,7 @@ def run_chunk_semantics(
         "schema_version": SCHEMA_VERSION,
         "chunk_dir": str(chunk_dir),
         "chunk_name": chunk_name,
+        "chunk_validation": assessment,
         "vlm_backend": vlm_backend,
         "prompt_variant_id": prompt_variant_id,
         "vlm_model": clf.model_name,
@@ -434,6 +462,8 @@ def run_chunk_semantics(
         },
         "frames": records,
     }
+    if chunk_warnings:
+        payload["chunk_validation_warnings"] = chunk_warnings
 
     if continue_on_inference_error:
         payload["vlm_inference_failure_count"] = inference_failure_count
