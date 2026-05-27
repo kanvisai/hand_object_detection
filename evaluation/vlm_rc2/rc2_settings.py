@@ -34,7 +34,7 @@ class VlmRc2Settings:
 
     # Servicio HTTP (semantics_service.py)
     service_host: str = "0.0.0.0"
-    service_port: int = 8080
+    service_port: int = 6161
     service_log_level: str = "info"
     service_skip_model_load: bool = False
 

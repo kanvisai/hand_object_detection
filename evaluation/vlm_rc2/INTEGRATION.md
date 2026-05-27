@@ -9,7 +9,7 @@ Orquestador Kanvis
     │  escribe chunk en volumen: /data/chunks/chunk_XXX/
     │  POST o CLI con --semantics-service-url
     ▼
-vlm-rc2-semantics:8080  (semantics_service.py, modelo cargado 1 vez)
+vlm-rc2-semantics:6161  (semantics_service.py, modelo cargado 1 vez)
     │  lee /data/chunks/chunk_XXX/frames + frames_meta.json
     ▼
 JSON semántica (stdout o chunk_XXX_vlm.json)
@@ -40,8 +40,8 @@ Ejemplo mínimo:
 
 ```json
 {
-  "service": { "host": "0.0.0.0", "port": 8080 },
-  "client": { "semantics_service_url": "http://127.0.0.1:8080", "timeout_sec": 900 },
+  "service": { "host": "0.0.0.0", "port": 6161 },
+  "client": { "semantics_service_url": "http://127.0.0.1:6161", "timeout_sec": 900 },
   "model": {
     "device": "cuda:0",
     "hf_token": "hf_xxxx",
@@ -64,14 +64,14 @@ cp vlm_rc2.settings.example.json vlm_rc2.settings.json
 # Edita model.device y model.hf_token
 
 python semantics_service.py
-# Lee host/port/model del JSON → http://0.0.0.0:8080 por defecto
+# Lee host/port/model del JSON → http://0.0.0.0:6161 por defecto
 ```
 
 Comprobar:
 
 ```bash
-curl -s http://127.0.0.1:8080/health
-curl -s http://127.0.0.1:8080/ready
+curl -s http://127.0.0.1:6161/health
+curl -s http://127.0.0.1:6161/ready
 ```
 
 `/ready` devuelve 503 hasta que el modelo terminó de cargar.
@@ -92,13 +92,13 @@ Si el servicio está en otra URL puntual:
 ```bash
 python run_semantics_rc2.py \
   --chunk-dir /data/chunks/chunk_001 \
-  --semantics-service-url http://otro-host:8080
+  --semantics-service-url http://otro-host:6161
 ```
 
 ## 3. API HTTP directa
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/semantics/chunk \
+curl -s -X POST http://127.0.0.1:6161/v1/semantics/chunk \
   -H 'Content-Type: application/json' \
   -d '{
     "chunk_dir": "/data/chunks/chunk_001",

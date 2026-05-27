@@ -12,7 +12,7 @@ services:
     image: vlm-rc2-semantics:local
     restart: unless-stopped
     ports:
-      - "${VLM_RC2_SERVICE_PORT:-8080}:8080"
+      - "${VLM_RC2_SERVICE_PORT:-6161}:6161"
     volumes:
       # Configuración (edita vlm_rc2.settings.json en el host antes de up)
       - ./vlm_rc2.settings.json:/app/vlm_rc2/vlm_rc2.settings.json:ro
@@ -26,7 +26,7 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6161/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

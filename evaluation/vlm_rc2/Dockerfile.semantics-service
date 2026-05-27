@@ -23,6 +23,6 @@ RUN pip3 install --upgrade pip && \
     "transformers>=4.46.3,<5" huggingface_hub accelerate safetensors \
     -r requirements-service.txt
 
-EXPOSE 8080
+EXPOSE 6161
 
 CMD ["python3", "semantics_service.py"]
